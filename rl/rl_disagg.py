@@ -157,6 +157,16 @@ def parse_args(argv=None):
                          "(+0.085, +0.069, +0.053, +0.020 at k=2,4,8,12), so 4 is the corner.")
     ap.add_argument("--bullet-max-tok", type=int, default=12,
                     help="tokens per bullet; matches the dictionary's <=12-token cap")
+    ap.add_argument("--prompt-file", default="",
+                    help="use THIS prompt instead of mxf.prompts.build_prompt_ids. Required when "
+                         "warm-starting an adapter that was SFT'd on a different prompt -- a lens "
+                         "must be read with the prompt it was trained on. The file holds the raw "
+                         "job text; the chat template is applied here (add_generation_prompt=True, "
+                         "enable_thinking=False) exactly as inv_train did, and the marker position "
+                         "is located by scanning for the injection character. NOTE maemm puts its "
+                         "marker LAST, arguing a mid-prompt marker leaves ~61 instruction tokens "
+                         "after it and 'empirically erased conditioning'; our SFT prompt has the "
+                         "marker at 40 of 186, so expect weaker conditioning than maemm's layout.")
     ap.add_argument("--reward-scale", type=float, default=1.0)
     ap.add_argument("--log-reward", action="store_true")
     ap.add_argument("--reward-window-last", type=int, default=0)
@@ -902,7 +912,24 @@ def run_rollout(a):
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    prompt_ids, mpos = build_prompt_ids(tok)
+    if a.prompt_file:
+        _job = open(a.prompt_file).read()
+        _txt = tok.apply_chat_template([{"role": "user", "content": _job}], tokenize=False,
+                                       add_generation_prompt=True, enable_thinking=False)
+        prompt_ids = tok.encode(_txt, add_special_tokens=False)
+        from mxf.config import INJECT_LAYER as _IL  # noqa: F401  (import kept for parity)
+        _inj = tok("\u3237", add_special_tokens=False).input_ids   # the injection marker char
+        _hits = [i for i, t in enumerate(prompt_ids) if [t] == _inj or t in _inj]
+        if len(_hits) != 1:
+            raise SystemExit("--prompt-file must contain EXACTLY one injection marker, found %d"
+                             % len(_hits))
+        mpos = [_hits[0]]
+        _log(tag, "prompt from %s: %d tokens, marker at %d (%d tokens follow it) -- maemm's own "
+                  "layout puts the marker last; a mid-prompt marker is reported to weaken "
+                  "conditioning" % (a.prompt_file, len(prompt_ids), mpos[0],
+                                    len(prompt_ids) - 1 - mpos[0]))
+    else:
+        prompt_ids, mpos = build_prompt_ids(tok)
     marker, p_len = mpos[0], len(prompt_ids)
     eos_ids = R._eos_ids(tok, _GenCfgStub(GenerationConfig.from_pretrained(MODEL)))
     rng = np.random.default_rng(a.seed * 7919 + 1000 + rank)
@@ -1024,7 +1051,24 @@ def run_bench_rollout(a):
     rank = int(os.environ["DISAGG_RANK"]); world = int(os.environ["DISAGG_WORLD"]); tag = f"B{rank}"
     work = a.work_dir
     tok = AutoTokenizer.from_pretrained(MODEL)
-    prompt_ids, mpos = build_prompt_ids(tok)
+    if a.prompt_file:
+        _job = open(a.prompt_file).read()
+        _txt = tok.apply_chat_template([{"role": "user", "content": _job}], tokenize=False,
+                                       add_generation_prompt=True, enable_thinking=False)
+        prompt_ids = tok.encode(_txt, add_special_tokens=False)
+        from mxf.config import INJECT_LAYER as _IL  # noqa: F401  (import kept for parity)
+        _inj = tok("\u3237", add_special_tokens=False).input_ids   # the injection marker char
+        _hits = [i for i, t in enumerate(prompt_ids) if [t] == _inj or t in _inj]
+        if len(_hits) != 1:
+            raise SystemExit("--prompt-file must contain EXACTLY one injection marker, found %d"
+                             % len(_hits))
+        mpos = [_hits[0]]
+        _log(tag, "prompt from %s: %d tokens, marker at %d (%d tokens follow it) -- maemm's own "
+                  "layout puts the marker last; a mid-prompt marker is reported to weaken "
+                  "conditioning" % (a.prompt_file, len(prompt_ids), mpos[0],
+                                    len(prompt_ids) - 1 - mpos[0]))
+    else:
+        prompt_ids, mpos = build_prompt_ids(tok)
     marker, p_len = mpos[0], len(prompt_ids)
     eos_ids = R._eos_ids(tok, _GenCfgStub(GenerationConfig.from_pretrained(MODEL)))
     # SFT adapter -> vLLM key layout (no actor needed: pure key rename, cf. rl.py _save_adapter_for_vllm)
@@ -1577,7 +1621,24 @@ def run_trainer(a):
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    prompt_ids, mpos = build_prompt_ids(tok)
+    if a.prompt_file:
+        _job = open(a.prompt_file).read()
+        _txt = tok.apply_chat_template([{"role": "user", "content": _job}], tokenize=False,
+                                       add_generation_prompt=True, enable_thinking=False)
+        prompt_ids = tok.encode(_txt, add_special_tokens=False)
+        from mxf.config import INJECT_LAYER as _IL  # noqa: F401  (import kept for parity)
+        _inj = tok("\u3237", add_special_tokens=False).input_ids   # the injection marker char
+        _hits = [i for i, t in enumerate(prompt_ids) if [t] == _inj or t in _inj]
+        if len(_hits) != 1:
+            raise SystemExit("--prompt-file must contain EXACTLY one injection marker, found %d"
+                             % len(_hits))
+        mpos = [_hits[0]]
+        _log(tag, "prompt from %s: %d tokens, marker at %d (%d tokens follow it) -- maemm's own "
+                  "layout puts the marker last; a mid-prompt marker is reported to weaken "
+                  "conditioning" % (a.prompt_file, len(prompt_ids), mpos[0],
+                                    len(prompt_ids) - 1 - mpos[0]))
+    else:
+        prompt_ids, mpos = build_prompt_ids(tok)
     marker, p_len = mpos[0], len(prompt_ids)
     prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
     B, G = a.groups_per_step, a.group_size
@@ -2018,7 +2079,24 @@ def run_bench_trainer(a):
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    prompt_ids, mpos = build_prompt_ids(tok)
+    if a.prompt_file:
+        _job = open(a.prompt_file).read()
+        _txt = tok.apply_chat_template([{"role": "user", "content": _job}], tokenize=False,
+                                       add_generation_prompt=True, enable_thinking=False)
+        prompt_ids = tok.encode(_txt, add_special_tokens=False)
+        from mxf.config import INJECT_LAYER as _IL  # noqa: F401  (import kept for parity)
+        _inj = tok("\u3237", add_special_tokens=False).input_ids   # the injection marker char
+        _hits = [i for i, t in enumerate(prompt_ids) if [t] == _inj or t in _inj]
+        if len(_hits) != 1:
+            raise SystemExit("--prompt-file must contain EXACTLY one injection marker, found %d"
+                             % len(_hits))
+        mpos = [_hits[0]]
+        _log(tag, "prompt from %s: %d tokens, marker at %d (%d tokens follow it) -- maemm's own "
+                  "layout puts the marker last; a mid-prompt marker is reported to weaken "
+                  "conditioning" % (a.prompt_file, len(prompt_ids), mpos[0],
+                                    len(prompt_ids) - 1 - mpos[0]))
+    else:
+        prompt_ids, mpos = build_prompt_ids(tok)
     marker, p_len = mpos[0], len(prompt_ids)
     prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
     t0 = time.time()
