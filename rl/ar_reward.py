@@ -98,6 +98,17 @@ def nnls_exact(B, t):
     return best_w, max(best_c, 0.0)
 
 
+def _distinct_fraction(input_ids, attention_mask):
+    """Vectorised distinct-token fraction (special tokens included). Copied from maemm rl.py so the
+    gate means the same thing under both objectives."""
+    masked = input_ids.masked_fill(~attention_mask.bool(), -1)
+    ordered = masked.sort(dim=1).values
+    unique = torch.ones(len(input_ids), dtype=torch.long, device=input_ids.device)
+    unique += (ordered[:, 1:] != ordered[:, :-1]).sum(1)
+    unique -= (~attention_mask.bool()).any(1).long()
+    return unique.float() / attention_mask.sum(1).clamp(min=1)
+
+
 class ARReward:
     """Frozen text -> modulation-vector AR plus the J and affine transforms, loaded once."""
 
@@ -244,8 +255,54 @@ class ARReward:
         return F.normalize(t, dim=-1)
 
     @torch.no_grad()
+    def fluency(self, texts, actor, tok, batch=64, max_len=128):
+        """-> (mean clean-base logp/token [n], distinct-token fraction [n]).
+
+        WHY THIS EXISTS. The geometric reward alone is satisfied by illegible phrases -- measured:
+        a 6-step run with --no-gates and kl=0 raised the reward 0.43 -> 0.65 while the rollouts
+        degenerated into four mutually unrelated fragments plus CJK ('Omega Phoenix Quadratic
+        Development of Quality of Mono Disaster Steel'). The policy learns to emit four
+        high-variance directions whose non-negative combination spans the target, which is
+        basis-fitting, not description. These are the gate inputs that penalise it.
+
+        Scored on the ACTOR with its adapter DISABLED (the clean base), exactly as maemm's score()
+        does -- not on the AR's own backbone, which is truncated and has no lm_head.
+        """
+        n = len(texts)
+        logp = torch.full((n,), -20.0)
+        dis = torch.zeros(n)
+        valid = [i for i, t in enumerate(texts) if (t or "").strip()]
+        if not valid or actor is None:
+            return logp, dis
+        prev = tok.padding_side
+        tok.padding_side = "right"
+        try:
+            for a in range(0, len(valid), batch):
+                idxs = valid[a:a + batch]
+                enc = tok([texts[i] for i in idxs], return_tensors="pt", padding=True,
+                          truncation=True, max_length=max_len,
+                          add_special_tokens=False).to(self.dev)
+                if enc["input_ids"].shape[1] < 2:
+                    continue
+                with actor.disable_adapter():
+                    logits = actor(**enc).logits[:, :-1].float()
+                tgt = enc["input_ids"][:, 1:]
+                tlp = -F.cross_entropy(logits.flatten(0, 1), tgt.flatten(),
+                                       reduction="none").view_as(tgt)
+                nm = enc["attention_mask"].bool()[:, 1:]
+                mlp = (tlp * nm).sum(1) / nm.sum(1).clamp(min=1)
+                # rows with no next-token logprob keep -20 so they FAIL the floor
+                logp[idxs] = torch.where(nm.any(1), mlp,
+                                         torch.full_like(mlp, -20.0)).cpu()
+                dis[idxs] = _distinct_fraction(enc["input_ids"],
+                                               enc["attention_mask"]).cpu()
+        finally:
+            tok.padding_side = prev
+        return logp, dis
+
+    @torch.no_grad()
     def score(self, texts, targets, actor, tok, k=4, max_tok=12, embed_batch=128,
-              pre_split=None, targets_are_raw=True):
+              pre_split=None, targets_are_raw=True, with_fluency=False):
         """maemm score() contract: -> r [len(texts)] on CPU.
 
         targets [n, D]. With targets_are_raw=True (the default, and what the maemm bank supplies)
@@ -276,4 +333,9 @@ class ARReward:
         self.last_stats = {"mean_bullets": float(np.mean(nb)) if nb else 0.0,
                            "frac_empty": float(sum(1 for x in bl if not x) / max(n, 1)),
                            "n_unique_bullets": len(uniq)}
+        if with_fluency:
+            lp, ds = self.fluency(texts, actor, tok)
+            self.last_stats["mean_logp"] = float(lp.mean())
+            self.last_stats["mean_distinct"] = float(ds.mean())
+            return r, lp, ds
         return r

@@ -85,7 +85,16 @@ TRAIN_ARGS = [
     "--prompt-file", AV_SFT + "/prompt.txt",
     "--reward-metric", "cosine",
     "--reward-scale", "1",
-    "--no-gates",                    # ARReward provides no fluency/distinct gates (it refuses if asked)
+    # LEGIBILITY PRESSURE. Measured on a 6-step run WITHOUT these: reward rose 0.43 -> 0.65 while
+    # the rollouts degenerated into four unrelated fragments plus CJK. The geometric term alone is
+    # satisfied by illegible phrases (inv_train's own docstring says so), so the run needs a floor
+    # on clean-base fluency and on token diversity, plus a KL anchor to the SFT policy.
+    "--fluency-floor", "-4.0",       # mean clean-base logp/token; word salad falls well below
+    "--distinct-floor", "0.6",       # repeated-token spam falls below
+    "--gate-penalty", "0.5",
+    # ScaleRL drops KL because its rewards are VERIFIABLE; ours is a learned surrogate and
+    # therefore hackable, so keep a small anchor to the warm start. Explicit flags beat the bundle.
+    "--kl-coef", "0.01",
     # ---- generation ----
     "--min-new-tokens", "16",
     "--max-new-tokens", "96",        # 4 bullets x <=12 tokens + '* ' scaffolding
@@ -99,6 +108,13 @@ TRAIN_ARGS = [
     "--adam-betas", "0.9", "0.95",
     "--score-batch", "128",
     "--vllm-gpu-mem", "0.85",
+    # CAP the concurrent sequences per rollout rank. --max-num-seqs defaults to
+    # rollout_block_groups * group_size, which at 16 x 256 is 4096 -- and vLLM's GDN
+    # linear-attention state buffer scales with it: gdn_linear_attn.py tried to allocate 18.09 GiB
+    # at engine start and OOMed the rollout rank. maemm's production is 1024 seqs over 2 rollout
+    # GPUs = 512/GPU, which is proven on B200 (~2.3 GB for the same buffer). The step's 4096
+    # rollouts are then generated in waves, which the disaggregated design overlaps with training.
+    "--max-num-seqs", "512",
     "--save-every", "0",
     "--save-steps", "10,25,50,100,200,300,400",
     "--save-dir", CKPT_DIR,
@@ -181,11 +197,16 @@ def train(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_ar
         args += ["--no-wandb"]
     if extra_args:
         args += extra_args.split()
-    cmd = [sys.executable, "/pmx/RL/rl_disagg.py", "--n-rollout", str(n_rollout),
-           "--n-trainer", str(n_trainer)] + args
+    # --role MUST be present in argv even though it defaults to "launch": the launcher rewrites
+    # its own argv for the children (child_argv[child_argv.index("--role") + 1] = role), so a
+    # missing flag raises ValueError("'--role' is not in list") before anything starts.
+    # cwd=/pmx with a RELATIVE script path, matching maemm's launcher -- the rollout/trainer
+    # children resolve RL/ and helpers/ from there.
+    cmd = ["python", "RL/rl_disagg.py", "--role", "launch",
+           "--n-rollout", str(n_rollout), "--n-trainer", str(n_trainer)] + args
     print("[launch] %s" % " ".join(cmd), flush=True)
     env = dict(os.environ, PYTHONPATH="/pmx/RL:/pmx/helpers:/pmx/eval")
-    return subprocess.run(cmd, env=env).returncode
+    return subprocess.run(cmd, cwd="/pmx", env=env).returncode
 
 
 @app.local_entrypoint()

@@ -72,6 +72,20 @@ print("[dedup] %s -> %s unique atoms (%.2f%% duplicate)"
 rho = np.array(T["rho"], dtype="float32")
 print("[in] %s atoms | rho mean %.4f sd %.4f" % ("{:,}".format(n), rho.mean(), rho.std()), flush=True)
 
+# ---- decide WHAT TO KEEP before loading any vectors ----------------------------------------
+# vmap is a dict of 11.57M separate numpy arrays: 118 GB of data plus ~112 bytes of object
+# overhead each, and with the metadata lists on top the container was killed at 128 GB and got
+# preempted three times at 320 GB. The filters below need only metadata, so apply them first and
+# insert vectors for the SURVIVORS only: 8.03M instead of 11.57M, ~85 GB, back inside 128 GB.
+_nt_pre = np.array(T["n_tokens"], dtype="int32")
+_ws_pre = np.array([("\n" in x) or ("\r" in x) or ("\t" in x) for x in T["span"]]) if BAN_WS \
+    else np.zeros(len(T["span"]), dtype=bool)
+_keep_pre = (_nt_pre <= MAXTOK) & (~_ws_pre)
+KEEPSET = {T["span"][i] for i in np.nonzero(_keep_pre)[0]}
+print("[pre] %s of %s atoms survive the <=%d-token and whitespace filters (%.1f%%) -- only their "
+      "vectors are loaded" % ("{:,}".format(len(KEEPSET)), "{:,}".format(len(_nt_pre)), MAXTOK,
+                              100.0 * len(KEEPSET) / max(len(_nt_pre), 1)), flush=True)
+
 # vectors, keyed by span so a chunk-order mismatch cannot silently misalign them
 vmap = {}
 for f in sorted(glob.glob(VEC + "/*.parquet")):
@@ -79,7 +93,8 @@ for f in sorted(glob.glob(VEC + "/*.parquet")):
     arr = t.column("vector").combine_chunks()
     V = np.asarray(arr.flatten().to_numpy(zero_copy_only=False), dtype="float16").reshape(-1, 5120)
     for s, v in zip(t.column("span").to_pylist(), V):
-        vmap[s] = v
+        if s in KEEPSET:
+            vmap[s] = v
 print("[in] %s vectors loaded" % "{:,}".format(len(vmap)), flush=True)
 
 # domain comes from the span bank, not the reliability tables -- join it back
@@ -118,13 +133,13 @@ print("[cols] added rho_per_token, rho_pct_in_len, agree_pct (length-neutral agr
 os.makedirs(OUT, exist_ok=True)
 report = {}
 if BAN_WS:
-    _ws = np.array([("\n" in x) or ("\r" in x) or ("\t" in x) for x in T["span"]])
+    _ws = _ws_pre
     _nws = int(_ws.sum())
     print("[ws] dropping %s of %s atoms containing newline/CR/tab (%.2f%%)"
           % ("{:,}".format(_nws), "{:,}".format(len(_ws)), 100.0 * _nws / max(len(_ws), 1)),
           flush=True)
 else:
-    _ws = np.zeros(len(T["span"]), dtype=bool)
+    _ws = _ws_pre
 
 _long = int((nt_a > MAXTOK).sum())
 print("[len] dropping %s of %s atoms over %d tokens (%.1f%%)"
@@ -180,7 +195,11 @@ print("\nASSEMBLE_DONE", flush=True)
 '''
 
 
-@app.function(image=img, volumes={"/vol": VOL}, cpu=8.0, memory=131072, timeout=7200)
+# memory=131072 was NOT enough and Modal killed the runner mid-write: the script loads EVERY
+# vector, and 11,571,229 x 5120 x fp16 is 118.5 GB against a 128 GB request, before the per-tier
+# copies. 320 GB clears it with room. (The cheaper fix is to stream vectors per tier instead of
+# loading the whole bank, but that is a rewrite and this runs once.)
+@app.function(image=img, volumes={"/vol": VOL}, cpu=8.0, memory=180224, timeout=10800)
 def run(md: str, vec: str, out: str,
         floors: str = "0.0,0.65,0.70,0.75", expect_chunks: int = 0,
         max_tokens: int = 12):

@@ -157,6 +157,11 @@ def parse_args(argv=None):
                          "(+0.085, +0.069, +0.053, +0.020 at k=2,4,8,12), so 4 is the corner.")
     ap.add_argument("--bullet-max-tok", type=int, default=12,
                     help="tokens per bullet; matches the dictionary's <=12-token cap")
+    ap.add_argument("--inj-char", default="\u321c",
+                    help="the injection marker character in --prompt-file. Default U+321C ('\u321c', "
+                         "single token, id 158983), which is inv_core.INJ_CHAR -- the marker the AV "
+                         "was SFT'd with, sitting inside <concept>...</concept>. Read it from the "
+                         "source rather than guessing: U+3237 looks similar and yields zero hits.")
     ap.add_argument("--prompt-file", default="",
                     help="use THIS prompt instead of mxf.prompts.build_prompt_ids. Required when "
                          "warm-starting an adapter that was SFT'd on a different prompt -- a lens "
@@ -917,13 +922,26 @@ def run_rollout(a):
         _txt = tok.apply_chat_template([{"role": "user", "content": _job}], tokenize=False,
                                        add_generation_prompt=True, enable_thinking=False)
         prompt_ids = tok.encode(_txt, add_special_tokens=False)
-        from mxf.config import INJECT_LAYER as _IL  # noqa: F401  (import kept for parity)
-        _inj = tok("\u3237", add_special_tokens=False).input_ids   # the injection marker char
-        _hits = [i for i, t in enumerate(prompt_ids) if [t] == _inj or t in _inj]
+        _inj = tok(a.inj_char, add_special_tokens=False).input_ids
+        if len(_inj) != 1:
+            raise SystemExit("--inj-char %r must be a SINGLE token, got %d: %s"
+                             % (a.inj_char, len(_inj), _inj))
+        _hits = [i for i, t in enumerate(prompt_ids) if t == _inj[0]]
         if len(_hits) != 1:
-            raise SystemExit("--prompt-file must contain EXACTLY one injection marker, found %d"
-                             % len(_hits))
+            raise SystemExit("--prompt-file must contain EXACTLY one %r (token id %d), found %d. "
+                             "The AV was SFT'd with inv_core.INJ_CHAR = U+321C; a different char "
+                             "means the injection would land in the wrong place."
+                             % (a.inj_char, _inj[0], len(_hits)))
         mpos = [_hits[0]]
+        # neighbour check, as inv_train asserts: the marker sits inside <concept>...</concept>, so
+        # a shifted position would inject into the tag rather than the slot.
+        _lo = tok("<concept>", add_special_tokens=False).input_ids
+        _hi = tok("</concept>", add_special_tokens=False).input_ids
+        _k = mpos[0]
+        if not (prompt_ids[_k - len(_lo):_k] == _lo and
+                prompt_ids[_k + 1:_k + 1 + len(_hi)] == _hi):
+            _log(tag, "WARNING marker neighbours are not <concept>/</concept>; injection may be "
+                      "misplaced relative to SFT")
         _log(tag, "prompt from %s: %d tokens, marker at %d (%d tokens follow it) -- maemm's own "
                   "layout puts the marker last; a mid-prompt marker is reported to weaken "
                   "conditioning" % (a.prompt_file, len(prompt_ids), mpos[0],
@@ -1056,13 +1074,26 @@ def run_bench_rollout(a):
         _txt = tok.apply_chat_template([{"role": "user", "content": _job}], tokenize=False,
                                        add_generation_prompt=True, enable_thinking=False)
         prompt_ids = tok.encode(_txt, add_special_tokens=False)
-        from mxf.config import INJECT_LAYER as _IL  # noqa: F401  (import kept for parity)
-        _inj = tok("\u3237", add_special_tokens=False).input_ids   # the injection marker char
-        _hits = [i for i, t in enumerate(prompt_ids) if [t] == _inj or t in _inj]
+        _inj = tok(a.inj_char, add_special_tokens=False).input_ids
+        if len(_inj) != 1:
+            raise SystemExit("--inj-char %r must be a SINGLE token, got %d: %s"
+                             % (a.inj_char, len(_inj), _inj))
+        _hits = [i for i, t in enumerate(prompt_ids) if t == _inj[0]]
         if len(_hits) != 1:
-            raise SystemExit("--prompt-file must contain EXACTLY one injection marker, found %d"
-                             % len(_hits))
+            raise SystemExit("--prompt-file must contain EXACTLY one %r (token id %d), found %d. "
+                             "The AV was SFT'd with inv_core.INJ_CHAR = U+321C; a different char "
+                             "means the injection would land in the wrong place."
+                             % (a.inj_char, _inj[0], len(_hits)))
         mpos = [_hits[0]]
+        # neighbour check, as inv_train asserts: the marker sits inside <concept>...</concept>, so
+        # a shifted position would inject into the tag rather than the slot.
+        _lo = tok("<concept>", add_special_tokens=False).input_ids
+        _hi = tok("</concept>", add_special_tokens=False).input_ids
+        _k = mpos[0]
+        if not (prompt_ids[_k - len(_lo):_k] == _lo and
+                prompt_ids[_k + 1:_k + 1 + len(_hi)] == _hi):
+            _log(tag, "WARNING marker neighbours are not <concept>/</concept>; injection may be "
+                      "misplaced relative to SFT")
         _log(tag, "prompt from %s: %d tokens, marker at %d (%d tokens follow it) -- maemm's own "
                   "layout puts the marker last; a mid-prompt marker is reported to weaken "
                   "conditioning" % (a.prompt_file, len(prompt_ids), mpos[0],
@@ -1626,13 +1657,26 @@ def run_trainer(a):
         _txt = tok.apply_chat_template([{"role": "user", "content": _job}], tokenize=False,
                                        add_generation_prompt=True, enable_thinking=False)
         prompt_ids = tok.encode(_txt, add_special_tokens=False)
-        from mxf.config import INJECT_LAYER as _IL  # noqa: F401  (import kept for parity)
-        _inj = tok("\u3237", add_special_tokens=False).input_ids   # the injection marker char
-        _hits = [i for i, t in enumerate(prompt_ids) if [t] == _inj or t in _inj]
+        _inj = tok(a.inj_char, add_special_tokens=False).input_ids
+        if len(_inj) != 1:
+            raise SystemExit("--inj-char %r must be a SINGLE token, got %d: %s"
+                             % (a.inj_char, len(_inj), _inj))
+        _hits = [i for i, t in enumerate(prompt_ids) if t == _inj[0]]
         if len(_hits) != 1:
-            raise SystemExit("--prompt-file must contain EXACTLY one injection marker, found %d"
-                             % len(_hits))
+            raise SystemExit("--prompt-file must contain EXACTLY one %r (token id %d), found %d. "
+                             "The AV was SFT'd with inv_core.INJ_CHAR = U+321C; a different char "
+                             "means the injection would land in the wrong place."
+                             % (a.inj_char, _inj[0], len(_hits)))
         mpos = [_hits[0]]
+        # neighbour check, as inv_train asserts: the marker sits inside <concept>...</concept>, so
+        # a shifted position would inject into the tag rather than the slot.
+        _lo = tok("<concept>", add_special_tokens=False).input_ids
+        _hi = tok("</concept>", add_special_tokens=False).input_ids
+        _k = mpos[0]
+        if not (prompt_ids[_k - len(_lo):_k] == _lo and
+                prompt_ids[_k + 1:_k + 1 + len(_hi)] == _hi):
+            _log(tag, "WARNING marker neighbours are not <concept>/</concept>; injection may be "
+                      "misplaced relative to SFT")
         _log(tag, "prompt from %s: %d tokens, marker at %d (%d tokens follow it) -- maemm's own "
                   "layout puts the marker last; a mid-prompt marker is reported to weaken "
                   "conditioning" % (a.prompt_file, len(prompt_ids), mpos[0],
@@ -1850,9 +1894,10 @@ def run_trainer(a):
         t_sc = time.time()
         if use_gates:
             if AR_REWARD is not None:
-                raise SystemExit("--ar-reward does not provide the fluency/distinct gates; "
-                                 "drop --fluency-floor/--distinct-floor or extend ARReward")
-            r, flu, dis = R.score(texts, dirs_rep, actor, tok, device, a, with_fluency=True)
+                r, flu, dis = AR_REWARD.score(texts, dirs_rep, actor, tok, k=a.bullets,
+                                              max_tok=a.bullet_max_tok, with_fluency=True)
+            else:
+                r, flu, dis = R.score(texts, dirs_rep, actor, tok, device, a, with_fluency=True)
         else:
             r = (AR_REWARD.score(texts, dirs_rep, actor, tok, k=a.bullets,
                                  max_tok=a.bullet_max_tok)
@@ -2084,13 +2129,26 @@ def run_bench_trainer(a):
         _txt = tok.apply_chat_template([{"role": "user", "content": _job}], tokenize=False,
                                        add_generation_prompt=True, enable_thinking=False)
         prompt_ids = tok.encode(_txt, add_special_tokens=False)
-        from mxf.config import INJECT_LAYER as _IL  # noqa: F401  (import kept for parity)
-        _inj = tok("\u3237", add_special_tokens=False).input_ids   # the injection marker char
-        _hits = [i for i, t in enumerate(prompt_ids) if [t] == _inj or t in _inj]
+        _inj = tok(a.inj_char, add_special_tokens=False).input_ids
+        if len(_inj) != 1:
+            raise SystemExit("--inj-char %r must be a SINGLE token, got %d: %s"
+                             % (a.inj_char, len(_inj), _inj))
+        _hits = [i for i, t in enumerate(prompt_ids) if t == _inj[0]]
         if len(_hits) != 1:
-            raise SystemExit("--prompt-file must contain EXACTLY one injection marker, found %d"
-                             % len(_hits))
+            raise SystemExit("--prompt-file must contain EXACTLY one %r (token id %d), found %d. "
+                             "The AV was SFT'd with inv_core.INJ_CHAR = U+321C; a different char "
+                             "means the injection would land in the wrong place."
+                             % (a.inj_char, _inj[0], len(_hits)))
         mpos = [_hits[0]]
+        # neighbour check, as inv_train asserts: the marker sits inside <concept>...</concept>, so
+        # a shifted position would inject into the tag rather than the slot.
+        _lo = tok("<concept>", add_special_tokens=False).input_ids
+        _hi = tok("</concept>", add_special_tokens=False).input_ids
+        _k = mpos[0]
+        if not (prompt_ids[_k - len(_lo):_k] == _lo and
+                prompt_ids[_k + 1:_k + 1 + len(_hi)] == _hi):
+            _log(tag, "WARNING marker neighbours are not <concept>/</concept>; injection may be "
+                      "misplaced relative to SFT")
         _log(tag, "prompt from %s: %d tokens, marker at %d (%d tokens follow it) -- maemm's own "
                   "layout puts the marker last; a mid-prompt marker is reported to weaken "
                   "conditioning" % (a.prompt_file, len(prompt_ids), mpos[0],
