@@ -41,7 +41,7 @@ COLLAPSED = ("* A sphere is unique in that every point on its surface is\n"
 
 
 @app.function(image=image, volumes={"/vol": vol}, gpu="B200", timeout=7200)
-def run(ckpt: str, n: int = 256, max_new: int = 96):
+def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key: str = "W_ridge0.1"):
     import sys, numpy as np, torch
     sys.path.insert(0, "/root"); sys.path.insert(0, "/root/src")
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -88,6 +88,12 @@ def run(ckpt: str, n: int = 256, max_new: int = 96):
 
     H = torch.from_numpy(np.fromfile(HOLDOUT, dtype="float32").reshape(-1, 5120)[:n]).float()
     R = ARR.ARReward(AR_DIR, JLENS, AFFINE, device=dev, read_layer=42, max_tokens=12, amu_path=AMU)
+    if whiten:
+        # Does whitening keep the CONDITIONING (matched - permuted) while killing the target-blind
+        # component? The affine was fit in the UNWHITENED space, so this is not free -- if matched
+        # collapses too, whitening is the wrong fix and a 13h run would have found that out slowly.
+        R.load_whitener(whiten, whiten_key)
+        print("[whiten] %s[%s] applied to BOTH sides" % (whiten, whiten_key), flush=True)
     # build_own(): the AR must be read on its OWN 43-layer truncation. Do NOT attach() to the
     # policy backbone -- measured, that halves the reward (0.331 vs 0.759).
     R.build_own("Qwen/Qwen3.6-27B")
@@ -119,7 +125,7 @@ def run(ckpt: str, n: int = 256, max_new: int = 96):
     def st(x):
         return float(x.mean()), float(x.std() / max(len(x) ** 0.5, 1))
 
-    out = {"ckpt": ckpt, "n": len(texts),
+    out = {"ckpt": ckpt, "n": len(texts), "whiten": whiten or None, "whiten_key": whiten_key if whiten else None,
            "matched": st(r_match), "permuted_roll1": st(r_perm), "permuted_rand": st(r_perm2),
            "constant_collapsed_string": st(r_const),
            "delta_matched_minus_permuted": float(r_match.mean() - r_perm.mean()),
@@ -132,12 +138,12 @@ def run(ckpt: str, n: int = 256, max_new: int = 96):
     print("\n  => reward attributable to READING the activation: %.4f"
           % out["delta_matched_minus_permuted"])
     os.makedirs("/vol/diag", exist_ok=True)
-    tag = ckpt.rstrip("/").replace("/vol/", "").replace("/", "_")
+    tag = ckpt.rstrip("/").replace("/vol/", "").replace("/", "_") + ("_whitened" if whiten else "")
     json.dump(out, open("/vol/diag/conditioning_%s.json" % tag, "w"), indent=1)
     vol.commit()
     return out
 
 
 @app.local_entrypoint()
-def main(ckpt: str = "/vol/av_sft_4b/final", n: int = 256):
-    run.remote(ckpt=ckpt, n=n)
+def main(ckpt: str = "/vol/av_sft_4b/final", n: int = 256, whiten: str = "", whiten_key: str = "W_ridge0.1"):
+    run.remote(ckpt=ckpt, n=n, whiten=whiten, whiten_key=whiten_key)
