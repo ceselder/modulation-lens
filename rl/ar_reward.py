@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""The modulation-lens reward, as a drop-in for maemm's rl.py:score().
+
+maemm's objective: inject a direction, the policy describes it, read the description back through
+the CLEAN base model and take a position-max cosine against the direction.
+
+Ours: the policy writes K bullets for a real L42 activation; each bullet is mapped to its
+modulation vector by the FROZEN AR; the bullets are combined by exact NON-NEGATIVE least squares;
+the reward is the cosine of that composition with the activation.
+
+Three facts this encodes, each measured rather than assumed:
+
+  * SPACE. Atoms are modulation reads (a phrase in a template, pooled over carrier positions);
+    targets are natural activations at one position. Two different L42 distributions. Comparing
+    them needs J *and* a fitted affine -- 4-atom FVE is 0.111 raw, 0.360 J-only, 0.349 affine-only,
+    0.633 with both. Do NOT whiten: whitening costs 6.3x (0.633 -> 0.057).
+  * The AR replaces 16 grid forwards per bullet with one. At 16 rollouts x 256 prompts x 4 bullets
+    that is the difference between ~16k and ~262k 27B forwards per step.
+  * The AR is a LoRA on the SAME base weights as the policy, so it is a second named adapter, not
+    a second 27B.
+
+The AR is accurate ON dictionary-like spans (held-out cos ~0.91) and degrades off-distribution
+(~0.47 on a different construction, though still better than ridge's 0.32 there). RL explores
+off-distribution by construction, so this reward must NOT be run alone -- keep the text term and
+the KL anchor, and spot-check against the true grid reward.
+"""
+import os
+import re
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+_BULLET_RE = re.compile(r"^\s*(?:[*•\-–]|\d+[.)])\s+")
+
+
+def split_bullets(text, k, max_tok, tok):
+    """-> up to k bullet strings, each truncated to max_tok TOKENS.
+
+    Truncating on tokens, not characters, because the AR reads tokens: a character cut can leave a
+    half token that the AR never saw in training.
+    """
+    # NOTE for replay/eval callers: 11.6% of bank atoms contain an embedded newline
+    # ('on Current Events\nOn August'), so joining atoms with '\n' and splitting on '\n' tears
+    # them in two. A POLICY will not emit newlines mid-bullet, so this only bites when
+    # reconstructing bullet text from the bank -- but that is exactly what calibration does.
+    # Callers replaying bank atoms should pass them as a list, not as joined text.
+    out = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        s = _BULLET_RE.sub("", s).strip()
+        if not s:
+            continue
+        ids = tok(s, add_special_tokens=False)["input_ids"][:max_tok]
+        if not ids:
+            continue
+        s = tok.decode(ids, skip_special_tokens=True).strip()
+        if s:
+            out.append(s)
+        if len(out) == k:
+            break
+    return out
+
+
+def nnls_exact(B, t):
+    """Exact non-negative least squares over a <=k support by enumerating every non-empty subset.
+
+    B [k, d] rows, t [d]. Clamping an unconstrained lstsq is NOT exact -- it can return a point that
+    is neither optimal nor feasible -- and k is small enough (<=4 -> 15 subsets) to enumerate.
+    Returns (w [k], cos of the reconstruction with t).
+    """
+    import itertools
+    k = B.shape[0]
+    best_w, best_c = torch.zeros(k, device=B.device), -1.0
+    G = B @ B.T
+    c = B @ t
+    for r in range(1, k + 1):
+        for sup in itertools.combinations(range(k), r):
+            idx = torch.tensor(sup, device=B.device)
+            Gs = G[idx][:, idx] + 1e-6 * torch.eye(r, device=B.device)
+            try:
+                w = torch.linalg.solve(Gs, c[idx])
+            except Exception:
+                continue
+            if bool((w < -1e-8).any()):
+                continue
+            w = w.clamp(min=0.0)
+            rec = w @ B[idx]
+            rn = rec.norm()
+            if float(rn) <= 1e-8:
+                continue
+            cc = float((rec @ t) / rn)
+            if cc > best_c:
+                best_c = cc
+                best_w = torch.zeros(k, device=B.device)
+                best_w[idx] = w
+    return best_w, max(best_c, 0.0)
+
+
+class ARReward:
+    """Frozen text -> modulation-vector AR plus the J and affine transforms, loaded once."""
+
+    def __init__(self, ar_dir, jlens_path, affine_path, device="cuda", read_layer=42,
+                 max_tokens=12, adapter_name="ar", amu_path=""):
+        self.dev = device
+        self.read_layer = read_layer
+        self.max_tokens = max_tokens
+        self.adapter_name = adapter_name
+        J = torch.load(jlens_path, map_location="cpu", weights_only=False)["J"][read_layer]
+        self.J = J.to(device).float()
+        self.M = torch.from_numpy(np.load(affine_path)).to(device).float()
+        hd = torch.load(os.path.join(ar_dir, "head.pt"), map_location=device)
+        D = self.J.shape[0]
+        self.head = torch.nn.Linear(D, D, bias=True).to(device, torch.float32)
+        self.head.load_state_dict(hd["head"])
+        self.head.eval()
+        for p in self.head.parameters():
+            p.requires_grad_(False)
+        # The activation-pool mean, subtracted in J-space. The bank holds RAW activations because
+        # that is what gets INJECTED into the policy; the reward's comparison space is a different
+        # transform of the same vector, so it is derived here rather than baked into the bank.
+        # Two DIFFERENT means is the measured configuration: one shared mean puts a blank string at
+        # 0.259 cosine, two means put it at 0.008.
+        self.amu = None
+        if amu_path:
+            z = np.load(amu_path)
+            self.amu = torch.tensor(z["mu"] if hasattr(z, "files") else z,
+                                    device=device).float()
+        self.ar_dir = ar_dir
+        self._hook_out = {}
+        self._handle = None
+
+    def build_own(self, base_model="Qwen/Qwen3.6-27B", dtype=None):
+        """Load the AR on its OWN backbone, truncated to read_layer+1, with the adapter applied.
+
+        Needed because the policy requires all layers to generate while the AR must be read on the
+        truncation it was trained with -- sharing one base model is not an option (0.331 vs 0.759).
+        Costs ~38 GB in bf16 for a 43-of-64-layer 27B, which is why this is a separate call and not
+        the default: on a disaggregated setup put it on the trainer ranks, or give the reward its
+        own GPU.
+
+        Suspected mechanism for the truncation sensitivity: this model has hybrid GDN
+        linear-attention layers carrying recurrent state, and training set
+        config.num_hidden_layers = read_layer+1 after truncating. If per-layer state allocation
+        keys off the layer count, an untruncated forward hands layer 42 a different state context.
+        Unverified -- hence the enforcement rather than a fix.
+        """
+        import torch as _t
+        from transformers import AutoModelForCausalLM
+        from peft import PeftModel
+        m, info = AutoModelForCausalLM.from_pretrained(
+            base_model, dtype=dtype or _t.bfloat16, device_map={"": self.dev},
+            output_loading_info=True)
+        miss = [k for k in info.get("missing_keys", []) if "lora" not in k]
+        if miss:
+            raise SystemExit("AR base weights did not load: %s" % miss[:3])
+        inner = m.model
+        inner.layers = _t.nn.ModuleList(list(inner.layers[: self.read_layer + 1]))
+        inner.config.num_hidden_layers = len(inner.layers)   # as ar_train_lora did
+        del m.lm_head
+        self.own = PeftModel.from_pretrained(inner, self.ar_dir).eval()
+        for q in self.own.parameters():
+            q.requires_grad_(False)
+        n = sum(1 for k, _ in self.own.named_parameters() if "lora" in k)
+        if n == 0:
+            raise SystemExit("AR adapter loaded 0 LoRA tensors from %s" % self.ar_dir)
+        stack = self.own.base_model.model
+        stack = stack if hasattr(stack, "layers") else stack.model
+        self._handle = stack.layers[self.read_layer].register_forward_hook(
+            lambda mm, i, o: self._hook_out.__setitem__(
+                "h", o[0] if isinstance(o, tuple) else o))
+        print("[ar] own backbone: %d layers, %d lora tensors" % (len(stack.layers), n), flush=True)
+        return self.own
+
+    def attach(self, actor, require_truncated=True):
+        """Load the AR as a SECOND named adapter on the policy's base weights and hook read_layer.
+
+        REFUSES an untruncated backbone by default. MEASURED: the identical adapter, read through a
+        64-layer Qwen3_5ForCausalLM instead of the 43-layer stack it was trained on, HALVES the
+        reward -- 0.331 vs 0.759 on the same atoms and activations, with every internal path
+        agreeing inside each config. A forward hook on layer 42 should not care what is above it and
+        the mechanism is unexplained, so this is enforced rather than documented: silently getting
+        half a reward is exactly the failure that survives a plausible-looking training curve.
+        """
+        inner0 = actor.base_model.model if hasattr(actor, "base_model") else actor.model
+        stack = inner0 if hasattr(inner0, "layers") else inner0.model
+        n_layers = len(stack.layers)
+        if require_truncated and n_layers != self.read_layer + 1:
+            raise SystemExit(
+                "AR backbone has %d layers; it was trained on %d (truncated to read_layer+1). "
+                "Reading it untruncated halves the reward (0.331 vs 0.759, measured). Truncate "
+                "with `base.layers = base.layers[:%d]` BEFORE wrapping in PeftModel, or pass "
+                "require_truncated=False if you have re-verified the calibration."
+                % (n_layers, self.read_layer + 1, self.read_layer + 1))
+        actor.load_adapter(self.ar_dir, adapter_name=self.adapter_name)
+        n = sum(1 for k, _ in actor.named_parameters() if self.adapter_name in k)
+        if n == 0:
+            raise SystemExit("AR adapter loaded 0 tensors under name %r" % self.adapter_name)
+        inner = actor.base_model.model if hasattr(actor, "base_model") else actor.model
+        layers = inner.layers if hasattr(inner, "layers") else inner.model.layers
+        self._handle = layers[self.read_layer].register_forward_hook(
+            lambda m, i, o: self._hook_out.__setitem__(
+                "h", o[0] if isinstance(o, tuple) else o))
+        return n
+
+    @torch.no_grad()
+    def embed(self, phrases, actor, tok, batch=128):
+        """-> [n, D] unit vectors in the TARGET comparison space (J then affine)."""
+        own = getattr(self, "own", None)
+        if own is not None:
+            actor = own                      # its own truncated backbone; no adapter switching
+            prev = None
+        else:
+            prev = getattr(actor, "active_adapter", None)
+            actor.set_adapter(self.adapter_name)
+        try:
+            out = torch.empty((len(phrases), self.J.shape[0]), dtype=torch.float32, device=self.dev)
+            for a in range(0, len(phrases), batch):
+                b = tok(phrases[a:a + batch], add_special_tokens=False, padding=True,
+                        truncation=True, max_length=self.max_tokens + 2,
+                        return_tensors="pt").to(self.dev)
+                actor(input_ids=b["input_ids"], attention_mask=b["attention_mask"], use_cache=False)
+                h = self._hook_out["h"]
+                m = b["attention_mask"].unsqueeze(-1).to(h.dtype)
+                pooled = (h * m).sum(1) / m.sum(1).clamp(min=1e-6)
+                out[a:a + batch] = self.head(pooled.float())
+        finally:
+            if prev is not None:
+                actor.set_adapter(prev)
+        v = (out @ self.J.T) @ self.M.T
+        return F.normalize(v, dim=-1)
+
+    def target_space(self, acts):
+        """RAW L42 activations [n, D] -> the reward's comparison space (J, minus AMU, unit).
+
+        Kept separate from score() so the bank can hold raw activations (what the policy is
+        INJECTED with) while the reward compares in J-space. Feeding already-transformed vectors
+        here would apply J twice.
+        """
+        t = acts.to(self.dev).float() @ self.J.T
+        if self.amu is not None:
+            t = t - self.amu
+        return F.normalize(t, dim=-1)
+
+    @torch.no_grad()
+    def score(self, texts, targets, actor, tok, k=4, max_tok=12, embed_batch=128,
+              pre_split=None, targets_are_raw=True):
+        """maemm score() contract: -> r [len(texts)] on CPU.
+
+        targets [n, D]. With targets_are_raw=True (the default, and what the maemm bank supplies)
+        they are RAW L42 activations and get transformed here; pass False only if the caller has
+        already applied J and the mean.
+        """
+        n = len(texts)
+        r = torch.zeros(n)
+        # pre_split lets a caller supply bullets directly (list-of-lists), bypassing the parser.
+        # Required when replaying bank atoms, which can contain newlines.
+        bl = (list(pre_split) if pre_split is not None
+              else [split_bullets(t, k, max_tok, tok) for t in texts])
+        uniq = sorted({b for row in bl for b in row})
+        if not uniq:
+            return r
+        emb = {p: i for i, p in enumerate(uniq)}
+        V = self.embed(uniq, actor, tok, batch=embed_batch)
+        tg = (self.target_space(targets) if targets_are_raw
+              else F.normalize(targets.to(self.dev).float(), dim=-1))
+        nb = []
+        for i, row in enumerate(bl):
+            if not row:
+                continue
+            B = V[torch.tensor([emb[p] for p in row], device=self.dev)]
+            _, cc = nnls_exact(B, tg[i])
+            r[i] = cc
+            nb.append(len(row))
+        self.last_stats = {"mean_bullets": float(np.mean(nb)) if nb else 0.0,
+                           "frac_empty": float(sum(1 for x in bl if not x) / max(n, 1)),
+                           "n_unique_bullets": len(uniq)}
+        return r
