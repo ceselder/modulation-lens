@@ -36,6 +36,12 @@ EXPECT = int(os.environ.get("EXPECT_CHUNKS", "0"))
 # clauses awkwardly concatenated rather than one unit. 12 also matches the bullet length used
 # elsewhere in the project.
 MAXTOK = int(os.environ.get("MAX_TOKENS", "12"))
+# BAN newline / CR / tab. 5.14% of mined spans contain one, and they are layout boilerplate that
+# spans a line break rather than a phrase: 'Sale price\nPickup', 'TEXTS\nPrice',
+# 'on Current Events\nOn August'. Same objection as multi-sentence concatenation -- two fragments
+# glued together is not one unit, however consistently it steers. It also broke bullet round-trips
+# (joining atoms with \n and splitting on \n tore 11.6% of them in two).
+BAN_WS = os.environ.get("BAN_WS", "1") == "1"
 print("[cfg] MD=%s VEC=%s OUT=%s FLOORS=%s" % (MD, VEC, OUT, FLOORS), flush=True)
 
 mdf = sorted(glob.glob(MD + "/*.parquet"))
@@ -111,12 +117,21 @@ print("[cols] added rho_per_token, rho_pct_in_len, agree_pct (length-neutral agr
 
 os.makedirs(OUT, exist_ok=True)
 report = {}
+if BAN_WS:
+    _ws = np.array([("\n" in x) or ("\r" in x) or ("\t" in x) for x in T["span"]])
+    _nws = int(_ws.sum())
+    print("[ws] dropping %s of %s atoms containing newline/CR/tab (%.2f%%)"
+          % ("{:,}".format(_nws), "{:,}".format(len(_ws)), 100.0 * _nws / max(len(_ws), 1)),
+          flush=True)
+else:
+    _ws = np.zeros(len(T["span"]), dtype=bool)
+
 _long = int((nt_a > MAXTOK).sum())
 print("[len] dropping %s of %s atoms over %d tokens (%.1f%%)"
       % ("{:,}".format(_long), "{:,}".format(len(nt_a)), MAXTOK, 100.0 * _long / max(len(nt_a), 1)),
       flush=True)
 for floor in FLOORS:
-    keep = np.nonzero((rho >= floor) & (nt_a <= MAXTOK))[0]
+    keep = np.nonzero((rho >= floor) & (nt_a <= MAXTOK) & (~_ws))[0]
     keep = np.array([i for i in keep if T["span"][i] in vmap], dtype=np.int64)
     tag = "all" if floor <= 0 else ("f%03d" % int(floor * 100))
     spans = [T["span"][i] for i in keep]

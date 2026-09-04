@@ -112,7 +112,7 @@ seen, bands, sig_count = set(), [dict() for _ in range(BANDS)], {}
 QUOTA = {T: TARGET // (MAXTOK - MINTOK + 1) for T in range(MINTOK, MAXTOK + 1)}
 filled = {T: 0 for T in QUOTA}
 out_s, out_t, out_d = [], [], []
-n_raw = n_ok = n_tok = n_ex = n_near = n_str = n_tag = 0
+n_raw = n_ok = n_tok = n_ex = n_near = n_str = n_tag = n_ws = 0
 _Ls = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12)
 
 for path in mine:
@@ -162,6 +162,12 @@ for path in mine:
                     if not span or len(span) > 130: continue
                     if _DIGIT.search(span) or not _OK.match(span): n_ok += 1; continue
                     if _TAGJUNK.search(span): n_tag += 1; continue
+                    # BAN newline/CR/tab: layout boilerplate spanning a line break, not a phrase.
+                    # 5.14% of spans before this ban -- 'Sale price\nPickup', 'TEXTS\nPrice',
+                    # 'on Current Events\nOn August'. Two fragments glued together is not one unit
+                    # however consistently it steers, and joining/splitting bullets on '\n' tore
+                    # 11.6% of them in two.
+                    if ("\n" in span) or ("\r" in span) or ("\t" in span): n_ws += 1; continue
                     # decode->encode must round-trip to the same length, or n_tokens is a lie
                     if len(TOK(span, add_special_tokens=False).input_ids) != T:
                         n_tok += 1; continue
@@ -189,7 +195,7 @@ pq.write_table(pa.table({"span": pa.array(out_s, pa.string()),
 import collections as _c
 _lc = _c.Counter(out_t)
 st = {"shard": SHARD, "emitted": len(out_s), "quota_per_len": TARGET // (MAXTOK - MINTOK + 1), "raw": n_raw, "drop_punct": n_ok,
-      "drop_roundtrip": n_tok, "drop_tagjunk": n_tag, "drop_exact": n_ex, "drop_near": n_near, "drop_struct": n_str,
+      "drop_roundtrip": n_tok, "drop_tagjunk": n_tag, "drop_whitespace": n_ws, "drop_exact": n_ex, "drop_near": n_near, "drop_struct": n_str,
       "keep_of_raw": len(out_s)/max(n_raw,1), "domains": len(set(out_d)),
       "len_hist": {int(k): int(v) for k, v in sorted(_lc.items())}}
 print("[shard %d] emitted %d of %d raw (%.1f%%) | punct %d tagjunk %d roundtrip %d exact %d near %d struct %d | %d domains | len 2-16 counts %s"
