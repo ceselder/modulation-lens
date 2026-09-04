@@ -85,20 +85,17 @@ TRAIN_ARGS = [
     "--prompt-file", AV_SFT + "/prompt.txt",
     "--reward-metric", "cosine",
     "--reward-scale", "1",
-    # ---- the two exploits the first 400-step run found, both now closed ----
-    # MEASURED on the SFT warm start, 256 holdout rows, greedy (matched/permuted/constant/delta):
-    #   unwhitened           0.7120 | 0.2352 | 0.1890 | 0.4768   <- constant is 48% of matched
-    #   whitened ridge 0.1   0.4491 | 0.1874 | 0.0974 | 0.2617   <- constant is 1.4% of matched
-    #   whitened ridge 0.01  0.4070 | 0.1777 | 0.0890 | 0.2294   <- worse on every signal/floor ratio
-    # ridge 0.1 wins (delta/permuted 1.40 vs 1.29). Absolute scale does not matter -- this is a
-    # reward, not a metric -- what matters is that a target-blind constant stops paying.
-    "--ar-whiten", "/vol/data/natural_whitener_jspace.npz",
-    "--ar-whiten-key", "W_ridge0.1",
-    # Whitening kills the CONSTANT exploit but not the residual permuted floor (0.187, still 42% of
-    # matched, and barely moved by stronger whitening). That floor is intrinsic: four NATURAL phrase
-    # embeddings fit an arbitrary NATURAL activation far better than the sqrt(4/5120)=0.028
-    # random-subspace bound, because both live on a language manifold. Only a contrastive reward
-    # removes it -- it subtracts the fit against mismatched targets, so what is optimised IS delta.
+    # ---- what the first two runs actually needed ----
+    # ROOT CAUSE (fixed in rl_disagg): bank rows were L2-normalised for steering and then used as
+    # reward targets, so subtracting the RAW-scale amu (||amu||=55) collapsed every target onto
+    # -amu. A FIXED string scored 0.185 against a real readout's 0.064 -- the objective REWARDED
+    # ignoring the activation 3:1, which is why the policy collapsed onto fixed bullets.
+    #
+    # With that fixed, WHITENING IS NO LONGER THE RIGHT TOOL and is deliberately off. Its only job
+    # was crushing the target-blind ceiling (0.343 -> 0.0064), but it halves the signal too
+    # (delta 0.4768 -> 0.2617 unwhitened->whitened, replace/greedy). The contrastive term removes
+    # the target-blind component BY CONSTRUCTION and at full strength: a constant answer scores
+    # fit(const,t_i) - fit(const,t_j) ~= 0 regardless of how much shared structure the space has.
     "--reward-contrast-negatives", "1",
     "--reward-contrast-weight", "1.0",
     # LEGIBILITY PRESSURE -- calibrated, after getting this wrong in both directions.
