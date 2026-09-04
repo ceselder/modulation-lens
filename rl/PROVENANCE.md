@@ -49,3 +49,67 @@ Leave `--ar-reward` blank and the maemm objective runs unchanged.
 * **Do not select on the reward alone.** Three times in one session the geometric score and the
   readability moved independently. Judge checkpoints on readouts over the reserved holdout
   (`build_bank.py` keeps the last 2048 rows out of training for exactly this).
+
+---
+
+## 2026-09-04 -- RL verdict: the 400-step ScaleRL run is a REGRESSION. Keep the SFT.
+
+Run `modlens_scalerl400` (wandb rnghem5a): 8x B200 (2 rollout + 6 trainer), 16x256, ScaleRL recipe,
+warm start `/vol/av_sft_4b/final`, frozen text->vector AR reward through J + affine. Stopped at
+~step 260 of 400 once the evaluation below came back.
+
+### The metric that matters
+
+Reward is a learned surrogate, so it cannot certify a lens. `rl/diag_conditioning.py` measures, on
+the 2048 holdout rows `build_bank.py` reserved, **greedily**:
+
+    matched   reward(readout_i, target_i)
+    permuted  reward(readout_i, target_{i+1})   and a random permutation
+    delta     matched - permuted  =  the only part that required reading the activation
+
+| checkpoint | matched | permuted | delta |
+|---|---|---|---|
+| SFT warm start | **0.7120 +- 0.0039** | 0.2352 | **0.4768** |
+| RL step 50 | 0.4565 +- 0.0072 | 0.2204 | 0.2361 |
+| RL step 200 | 0.4642 +- 0.0075 | 0.2303 | 0.2339 |
+
+Matched fell 0.71 -> 0.46 (~35 SE); delta HALVED. Meanwhile the training reward rose 0.32 -> 0.85.
+**The reward and the property it proxies moved in opposite directions for 200 steps.**
+
+### Why
+
+1. **A target-blind answer earns 0.343.** `rl/diag_constant_baseline.py`, 20k bank rows, targets =
+   normalize(J.h - amu): mean pairwise cos 0.1182, best constant direction **0.3432**, variance in
+   top 1/4/16 PCs 0.132/0.229/0.424. After whitening the same ceiling is **0.0064** (54x lower).
+   The policy bought exactly this: from step 40 on, one of four bullets was a fixed phrase emitted
+   verbatim for every activation ('* Spheres are unique in that every point on their surface is').
+   By step 200 TWO of four were fixed even greedily, and matched 0.46 sits at the
+   sqrt(0.229) = 0.48 fixed-4-basis ceiling.
+2. **T=1.0 hides half the policy.** ScaleRL requires T=1.0 (the sampler's logprobs are the
+   behaviour policy). Greedy SFT scores 0.712 where RL step 0 reported 0.321, so entropy collapse
+   (3.66 -> 0.36) RECOVERS sampling loss and looks like learning. Never compare a T=1.0 reward
+   curve against a greedy baseline.
+3. **kl_coef 0.01 anchored nothing** -- kl_to_init 4.2 by step 80, asterisk spam at cos 0.000 past
+   step ~170.
+
+### Ruled out
+
+* Injection is exact: `cos=1.0000 ratio=1.000 ||h||=24.0 (published 24.2) pre-marker max|d|=0`.
+* The SFT does condition on the injection: delta 0.4768, ~60 SE. e.g. holdout row 0, whose text was
+  "Are those famous beads around your neck cutting off the circulation to your brain?", reads out
+  '* are you out of your mind / * the head of the company is a bit dim / ... / * the brain and the'.
+
+### What a corrected run needs
+
+* Remove the target-blind component: `--ar-whiten /vol/data/natural_whitener_jspace.npz
+  --ar-whiten-key W_ridge0.1` (applied to BOTH sides -- the affine maps atoms into the UNWHITENED
+  space), or `--reward-contrast-negatives N` (the permutation control as the objective).
+* Far more KL than 0.01, and checkpoint selection on greedy holdout delta, never on reward.
+
+### Dictionary status (same session)
+
+`/vol/dict_5m` tier `all` VERIFIED complete: meta 8,028,555 rows == 33 vec shards, 8,028,555 rows
+(<=12 tokens, newlines banned, rho mean 0.7015, 68 domains). Tier `f065` has a truncated shard from
+a Modal preemption and must be regenerated -- it is derivable from `all` plus meta's `rho` column,
+so the expensive measurement pass does NOT need repeating. Tiers 0.70/0.75 were never written.
+`rl/verify_dict.py` re-runs the meta-vs-shard row-count check.
