@@ -160,3 +160,35 @@ equals `hnorm*STEER_COEFF*unit(v)`.
   mechanism: it was trained against an inverted objective.
 * STILL OPEN, separately: the rollout injects KARVONEN while the SFT and all evals use REPLACE,
   costing 34% of the delta (0.2298 -> 0.1520). Worth fixing; not the root cause.
+
+---
+
+## 2026-09-04 (post-fix) -- RL now IMPROVES the lens, in both injection modes
+
+`modlens_fixed_contrast100` (wandb bdvkqi79), 8x B200, 16x256, contrast reward (1 negative,
+group-strided), NO whitening, kl 0.1, raw targets. Greedy/sampled conditioning eval on 256 bank
+rows, matched / permuted / delta:
+
+| arm | matched | permuted | delta |
+|---|---|---|---|
+| SFT, replace/greedy (deployment mode) | 0.7120 | 0.2352 | 0.4768 |
+| **step_10, replace/greedy** | **0.7323** | **0.2075** | **0.5248** |
+| SFT, karvonen/T=1.0 (training mode) | 0.5786 | 0.2283 | 0.3503 |
+| **step_10, karvonen/T=1.0** | **0.6527** | **0.2129** | **0.4398** |
+
+delta +0.048 in the deployment mode (~6 SE on a delta SE of ~0.008) and +0.090 in the training
+mode. matched rises AND permuted falls in both, which is the signature of better conditioning --
+a shortcut would raise both together. The fixed constant string is unchanged at 0.1916.
+
+Trainer-side decomposition over the same span: matched_fit 0.5522 -> 0.6212, neg_fit
+0.2191 -> 0.2033. Reward 0.327 -> 0.417 with entropy 3.68 -> 3.42 and kl_to_init 0.16 -- compare the
+broken run, which hit reward 0.738 with entropy 2.07 by step 20 because it was racing to a constant.
+
+Trajectory in the deployment mode, before and after the normalisation fix:
+
+    SFT baseline          0.4768
+    broken run step 50    0.2361
+    broken run step 200   0.2339
+    FIXED run step 10     0.5248
+
+Selection stays on this metric, never on reward.
