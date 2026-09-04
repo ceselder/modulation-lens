@@ -133,6 +133,16 @@ class ARReward:
         # transform of the same vector, so it is derived here rather than baked into the bank.
         # Two DIFFERENT means is the measured configuration: one shared mean puts a blank string at
         # 0.259 cosine, two means put it at 0.008.
+        # WHITENER (optional, off by default). MEASURED 2026-09-04 on 20k bank activations: in the
+        # mean-subtracted J space the best TARGET-BLIND constant direction scores cos 0.343, and a
+        # 400-step run exploited exactly that -- from step 40 on, one of the four bullets was a
+        # fixed phrase emitted verbatim for every activation ('* Spheres are unique in that every
+        # point on their surface is'), soaking up the shared component while the other three did
+        # the target-specific work. After whitening the same target-blind ceiling is 0.0064 (54x
+        # lower), so the shortcut stops paying. Must be applied to BOTH sides of the cosine: the
+        # affine M maps atoms into the UNWHITENED activation space, so whitening only the targets
+        # would break the alignment.
+        self.W = None
         self.amu = None
         if amu_path:
             z = np.load(amu_path)
@@ -140,7 +150,30 @@ class ARReward:
                                     device=device).float()
         self.ar_dir = ar_dir
         self._hook_out = {}
+        self._whiten_key = None
         self._handle = None
+
+    def load_whitener(self, path, key="W_ridge0.1"):
+        """Load an inverse-sqrt-covariance whitener for the J-space comparison.
+
+        VERIFIED for natural_whitener_jspace.npz: both W_ridge0.01 and W_ridge0.1 are symmetric to
+        <1e-10 and their eigenvalues equal 1/sqrt(eigval + lam) exactly, i.e. genuine C^-1/2 in
+        J-space at layer 42 (n=60000, k90=490). eigvals.min()==0, so the un-ridged inverse does not
+        exist -- use a ridge key, never a raw inverse.
+        """
+        z = np.load(path)
+        if key not in z.files:
+            raise SystemExit("whitener key %r not in %s (have %s)" % (key, path, z.files))
+        W = torch.tensor(z[key], device=self.dev).float()
+        if W.shape != (self.J.shape[0], self.J.shape[0]):
+            raise SystemExit("whitener %s is %s, expected [%d,%d]"
+                             % (key, tuple(W.shape), self.J.shape[0], self.J.shape[0]))
+        self.W = W
+        self._whiten_key = key
+        return self
+
+    def _maybe_whiten(self, x):
+        return x if self.W is None else x @ self.W
 
     def build_own(self, base_model="Qwen/Qwen3.6-27B", dtype=None):
         """Load the AR on its OWN backbone, truncated to read_layer+1, with the adapter applied.
@@ -240,7 +273,7 @@ class ARReward:
             if prev is not None:
                 actor.set_adapter(prev)
         v = (out @ self.J.T) @ self.M.T
-        return F.normalize(v, dim=-1)
+        return F.normalize(self._maybe_whiten(v), dim=-1)
 
     def target_space(self, acts):
         """RAW L42 activations [n, D] -> the reward's comparison space (J, minus AMU, unit).
@@ -252,7 +285,7 @@ class ARReward:
         t = acts.to(self.dev).float() @ self.J.T
         if self.amu is not None:
             t = t - self.amu
-        return F.normalize(t, dim=-1)
+        return F.normalize(self._maybe_whiten(t), dim=-1)
 
     @torch.no_grad()
     @torch.no_grad()   # inherited from score() when called there, but the percentile monitor calls
@@ -319,7 +352,8 @@ class ARReward:
 
     @torch.no_grad()
     def score(self, texts, targets, actor, tok, k=4, max_tok=12, embed_batch=128,
-              pre_split=None, targets_are_raw=True, with_fluency=False):
+              pre_split=None, targets_are_raw=True, with_fluency=False,
+              contrast_negatives=0, contrast_weight=1.0):
         """maemm score() contract: -> r [len(texts)] on CPU.
 
         targets [n, D]. With targets_are_raw=True (the default, and what the maemm bank supplies)
@@ -339,12 +373,27 @@ class ARReward:
         V = self.embed(uniq, actor, tok, batch=embed_batch)
         tg = (self.target_space(targets) if targets_are_raw
               else F.normalize(targets.to(self.dev).float(), dim=-1))
+        # CONTRASTIVE reward (contrast_negatives>0): r_i = fit(bullets_i, target_i)
+        #   - contrast_weight * mean_j fit(bullets_i, target_{i+j+1 mod n})
+        # The plain reconstruction reward is partly satisfiable WITHOUT reading the activation --
+        # measured, a target-blind constant direction scores 0.343 in the mean-subtracted J space,
+        # and a 400-step run duly spent one of its four bullets on a fixed phrase emitted for every
+        # activation. Subtracting the fit against MISMATCHED targets credits only the part that
+        # depends on which activation was injected, which is the quantity a lens is supposed to
+        # carry. This is the permutation control promoted to being the objective.
         nb = []
+        n_t = tg.shape[0]
         for i, row in enumerate(bl):
             if not row:
                 continue
             B = V[torch.tensor([emb[p] for p in row], device=self.dev)]
             _, cc = nnls_exact(B, tg[i])
+            if contrast_negatives > 0 and n_t > 1:
+                negs = []
+                for j in range(min(contrast_negatives, n_t - 1)):
+                    _, cn = nnls_exact(B, tg[(i + j + 1) % n_t])
+                    negs.append(cn)
+                cc = cc - contrast_weight * (sum(negs) / len(negs))
             r[i] = cc
             nb.append(len(row))
         self.last_stats = {"mean_bullets": float(np.mean(nb)) if nb else 0.0,

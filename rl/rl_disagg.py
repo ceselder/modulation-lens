@@ -144,6 +144,16 @@ def parse_args(argv=None):
                          "composition with the activation. Validated at 94% of the "
                          "measured-vector reference; retention is ~95% at every arity 1..12.")
     ap.add_argument("--ar-jlens", default="", help="lens.pt holding J[layer] (required with --ar-reward)")
+    # Whitening the comparison space removes the target-blind component of the reward: a
+    # constant direction is worth cos 0.343 unwhitened and 0.0064 whitened (measured, 20k rows),
+    # and the first run duly spent one of four bullets on a fixed phrase. Applied to BOTH sides.
+    ap.add_argument("--ar-whiten", default="", help="npz holding a J-space whitener (C^-1/2)")
+    ap.add_argument("--ar-whiten-key", default="W_ridge0.1",
+                    help="key inside --ar-whiten; must be a RIDGED inverse (eigvals.min()==0)")
+    # Contrastive alternative to whitening: credit only the part of the fit that depends on
+    # WHICH activation was injected. r_i = fit(b_i, t_i) - w * mean_j fit(b_i, t_{i+j+1}).
+    ap.add_argument("--reward-contrast-negatives", type=int, default=0)
+    ap.add_argument("--reward-contrast-weight", type=float, default=1.0)
     ap.add_argument("--ar-affine", default="",
                     help="the fitted atom->activation alignment (required with --ar-reward). "
                          "Atoms are modulation reads, targets are natural activations: two "
@@ -1722,6 +1732,9 @@ def run_trainer(a):
         AR_REWARD = ARR.ARReward(a.ar_reward, a.ar_jlens, a.ar_affine, device=device,
                                  read_layer=getattr(a, "layer", 42),
                                  max_tokens=a.bullet_max_tok, amu_path=a.ar_amu)
+        if a.ar_whiten:
+            AR_REWARD.load_whitener(a.ar_whiten, a.ar_whiten_key)
+            _log(tag, "reward whitened in J-space: %s[%s]" % (a.ar_whiten, a.ar_whiten_key))
         AR_REWARD.build_own(MODEL)
         # The distinct-token fraction needs token ids only. Skip the clean-base logits forward
         # unless a fluency floor is actually in play, so a distinct-only gate is free.
@@ -1910,12 +1923,16 @@ def run_trainer(a):
         if use_gates:
             if AR_REWARD is not None:
                 r, flu, dis = AR_REWARD.score(texts, dirs_rep, actor, tok, k=a.bullets,
-                                              max_tok=a.bullet_max_tok, with_fluency=True)
+                                              max_tok=a.bullet_max_tok, with_fluency=True,
+                                              contrast_negatives=a.reward_contrast_negatives,
+                                              contrast_weight=a.reward_contrast_weight)
             else:
                 r, flu, dis = R.score(texts, dirs_rep, actor, tok, device, a, with_fluency=True)
         else:
             r = (AR_REWARD.score(texts, dirs_rep, actor, tok, k=a.bullets,
-                                 max_tok=a.bullet_max_tok)
+                                 max_tok=a.bullet_max_tok,
+                                 contrast_negatives=a.reward_contrast_negatives,
+                                 contrast_weight=a.reward_contrast_weight)
                  if AR_REWARD is not None
                  else R.score(texts, dirs_rep, actor, tok, device, a))
         r = r * a.reward_scale
