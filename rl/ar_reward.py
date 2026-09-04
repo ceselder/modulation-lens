@@ -353,7 +353,7 @@ class ARReward:
     @torch.no_grad()
     def score(self, texts, targets, actor, tok, k=4, max_tok=12, embed_batch=128,
               pre_split=None, targets_are_raw=True, with_fluency=False,
-              contrast_negatives=0, contrast_weight=1.0):
+              contrast_negatives=0, contrast_weight=1.0, group_stride=1):
         """maemm score() contract: -> r [len(texts)] on CPU.
 
         targets [n, D]. With targets_are_raw=True (the default, and what the maemm bank supplies)
@@ -388,12 +388,21 @@ class ARReward:
                 continue
             B = V[torch.tensor([emb[p] for p in row], device=self.dev)]
             _, cc = nnls_exact(B, tg[i])
-            if contrast_negatives > 0 and n_t > 1:
+            if contrast_negatives > 0 and n_t > group_stride:
+                # STRIDE BY THE GROUP SIZE. targets arrive as repeat_interleave(G), so `group_stride`
+                # consecutive rows share ONE activation: offsetting by 1 would compare a readout
+                # against its OWN target for (G-1)/G of the batch, making the contrast identically
+                # zero for 94% of rollouts at G=16 and handing the zero-variance filter the entire
+                # batch. The negative must come from a DIFFERENT group.
                 negs = []
-                for j in range(min(contrast_negatives, n_t - 1)):
-                    _, cn = nnls_exact(B, tg[(i + j + 1) % n_t])
+                for j in range(contrast_negatives):
+                    k_off = (i + (j + 1) * group_stride) % n_t
+                    if k_off // max(group_stride, 1) == i // max(group_stride, 1):
+                        continue                      # same group -> same target, not a negative
+                    _, cn = nnls_exact(B, tg[k_off])
                     negs.append(cn)
-                cc = cc - contrast_weight * (sum(negs) / len(negs))
+                if negs:
+                    cc = cc - contrast_weight * (sum(negs) / len(negs))
             r[i] = cc
             nb.append(len(row))
         self.last_stats = {"mean_bullets": float(np.mean(nb)) if nb else 0.0,

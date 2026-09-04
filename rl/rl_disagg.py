@@ -1925,14 +1925,16 @@ def run_trainer(a):
                 r, flu, dis = AR_REWARD.score(texts, dirs_rep, actor, tok, k=a.bullets,
                                               max_tok=a.bullet_max_tok, with_fluency=True,
                                               contrast_negatives=a.reward_contrast_negatives,
-                                              contrast_weight=a.reward_contrast_weight)
+                                              contrast_weight=a.reward_contrast_weight,
+                                              group_stride=G)
             else:
                 r, flu, dis = R.score(texts, dirs_rep, actor, tok, device, a, with_fluency=True)
         else:
             r = (AR_REWARD.score(texts, dirs_rep, actor, tok, k=a.bullets,
                                  max_tok=a.bullet_max_tok,
                                  contrast_negatives=a.reward_contrast_negatives,
-                                 contrast_weight=a.reward_contrast_weight)
+                                 contrast_weight=a.reward_contrast_weight,
+                                 group_stride=G)
                  if AR_REWARD is not None
                  else R.score(texts, dirs_rep, actor, tok, device, a))
         r = r * a.reward_scale
