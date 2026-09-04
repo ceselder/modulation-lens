@@ -255,6 +255,8 @@ class ARReward:
         return F.normalize(t, dim=-1)
 
     @torch.no_grad()
+    @torch.no_grad()   # inherited from score() when called there, but the percentile monitor calls
+                       # this DIRECTLY -- without it, a 256-seq 27B forward builds a graph and OOMs.
     def fluency(self, texts, actor, tok, batch=64, max_len=128, need_logp=None):
         """-> (mean clean-base logp/token [n], distinct-token fraction [n]).
 
