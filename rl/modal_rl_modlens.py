@@ -85,6 +85,22 @@ TRAIN_ARGS = [
     "--prompt-file", AV_SFT + "/prompt.txt",
     "--reward-metric", "cosine",
     "--reward-scale", "1",
+    # ---- the two exploits the first 400-step run found, both now closed ----
+    # MEASURED on the SFT warm start, 256 holdout rows, greedy (matched/permuted/constant/delta):
+    #   unwhitened           0.7120 | 0.2352 | 0.1890 | 0.4768   <- constant is 48% of matched
+    #   whitened ridge 0.1   0.4491 | 0.1874 | 0.0974 | 0.2617   <- constant is 1.4% of matched
+    #   whitened ridge 0.01  0.4070 | 0.1777 | 0.0890 | 0.2294   <- worse on every signal/floor ratio
+    # ridge 0.1 wins (delta/permuted 1.40 vs 1.29). Absolute scale does not matter -- this is a
+    # reward, not a metric -- what matters is that a target-blind constant stops paying.
+    "--ar-whiten", "/vol/data/natural_whitener_jspace.npz",
+    "--ar-whiten-key", "W_ridge0.1",
+    # Whitening kills the CONSTANT exploit but not the residual permuted floor (0.187, still 42% of
+    # matched, and barely moved by stronger whitening). That floor is intrinsic: four NATURAL phrase
+    # embeddings fit an arbitrary NATURAL activation far better than the sqrt(4/5120)=0.028
+    # random-subspace bound, because both live on a language manifold. Only a contrastive reward
+    # removes it -- it subtracts the fit against mismatched targets, so what is optimised IS delta.
+    "--reward-contrast-negatives", "1",
+    "--reward-contrast-weight", "1.0",
     # LEGIBILITY PRESSURE -- calibrated, after getting this wrong in both directions.
     #
     # I first claimed a 6-step ungated run reward-hacked (reward 0.32 -> 0.43 with "degenerate"
@@ -110,7 +126,9 @@ TRAIN_ARGS = [
     # ScaleRL drops KL because its rewards are VERIFIABLE; ours is a learned surrogate and
     # therefore hackable in principle, so keep a small anchor to the warm start. Cheap insurance:
     # measured kl 0.0003-0.0010, i.e. it is not currently binding. Explicit flags beat the bundle.
-    "--kl-coef", "0.01",
+    # 0.01 anchored NOTHING: kl_to_init reached 4.2 by step 80, entropy fell 3.66 -> 0.36, and the
+    # run destabilised into asterisk spam (cos 0.000 at the 96-token cap) past step ~170.
+    "--kl-coef", "0.1",
     # ---- generation ----
     "--min-new-tokens", "16",
     "--max-new-tokens", "96",        # 4 bullets x <=12 tokens + '* ' scaffolding
@@ -132,7 +150,10 @@ TRAIN_ARGS = [
     # rollouts are then generated in waves, which the disaggregated design overlaps with training.
     "--max-num-seqs", "512",
     "--save-every", "0",
-    "--save-steps", "10,25,50,100,200,300,400",
+    # The regression was ALREADY complete by step 50 last time (greedy delta 0.477 -> 0.236), so
+    # 400 steps just burned GPU past the point of failure. Short run, dense early checkpoints, and
+    # selection on greedy holdout delta via rl/diag_conditioning.py -- never on reward.
+    "--save-steps", "10,25,50,100",
     "--save-dir", CKPT_DIR,
 ]
 
