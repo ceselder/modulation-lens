@@ -85,15 +85,31 @@ TRAIN_ARGS = [
     "--prompt-file", AV_SFT + "/prompt.txt",
     "--reward-metric", "cosine",
     "--reward-scale", "1",
-    # LEGIBILITY PRESSURE. Measured on a 6-step run WITHOUT these: reward rose 0.43 -> 0.65 while
-    # the rollouts degenerated into four unrelated fragments plus CJK. The geometric term alone is
-    # satisfied by illegible phrases (inv_train's own docstring says so), so the run needs a floor
-    # on clean-base fluency and on token diversity, plus a KL anchor to the SFT policy.
-    "--fluency-floor", "-4.0",       # mean clean-base logp/token; word salad falls well below
-    "--distinct-floor", "0.6",       # repeated-token spam falls below
+    # LEGIBILITY PRESSURE -- calibrated, after getting this wrong in both directions.
+    #
+    # I first claimed a 6-step ungated run reward-hacked (reward 0.32 -> 0.43 with "degenerate"
+    # rollouts). That was WRONG: it came from the stdout `sample` line, which truncates at ~100
+    # chars, and the two fragments I quoted were the 4th bullet of rows whose first three bullets
+    # were fluent English. Reading all 16 rows/step, text quality IMPROVED as reward rose
+    # (non-ASCII 0.022 -> 0.002; step-0 junk like '* yeratarau te wair' gone by step 5).
+    #
+    # The gates I then added were miscalibrated the other way: --fluency-floor -4.0 rejected 99.4%
+    # of rollouts (reward/gate_frac 0.0056). That logp is UNCONDITIONED (raw text, no prompt), so
+    # bullet fragments sit far below conditioned prose; -4.0 was a guess and a bad one. A gate that
+    # fires on ~all samples is a near-constant offset that cancels under batch-normalized
+    # advantages, adds variance, and hands the surviving 0.6% outsized advantage.
+    #
+    # So: MEASURE first (--flu-monitor-every logs logp/distinct percentiles without gating), keep
+    # the one gate that was actually validated, and re-add a fluency floor only from percentiles.
+    "--no-fluency-floor",            # was -4.0: rejected 99.4% of legible rollouts. Measure first.
+    "--distinct-floor", "0.6",       # VALIDATED: min 0.706 over 32 good rollouts, so non-binding
+                                     # on good text but still catches repetition spam. Free (no forward).
     "--gate-penalty", "0.5",
+    "--flu-monitor-every", "10",
+    "--flu-monitor-n", "256",
     # ScaleRL drops KL because its rewards are VERIFIABLE; ours is a learned surrogate and
-    # therefore hackable, so keep a small anchor to the warm start. Explicit flags beat the bundle.
+    # therefore hackable in principle, so keep a small anchor to the warm start. Cheap insurance:
+    # measured kl 0.0003-0.0010, i.e. it is not currently binding. Explicit flags beat the bundle.
     "--kl-coef", "0.01",
     # ---- generation ----
     "--min-new-tokens", "16",

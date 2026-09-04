@@ -178,6 +178,15 @@ def parse_args(argv=None):
     ap.add_argument("--reward-topk", type=int, default=1)
     ap.add_argument("--reward-pos-penalty", type=float, default=0.0)
     ap.add_argument("--fluency-floor", type=float, default=-4.5)
+    # Monitoring, not gating: sample the unconditioned-logp distribution so a floor can be set
+    # from percentiles instead of a guess. A guessed -4.0 rejected 99.4% of legible rollouts.
+    ap.add_argument("--flu-monitor-every", type=int, default=0,
+                    help="log fluency/distinct percentiles every N steps on a subsample (0=off). "
+                         "Costs one clean-base forward over --flu-monitor-n rollouts.")
+    ap.add_argument("--flu-monitor-n", type=int, default=256)
+    ap.add_argument("--no-fluency-floor", action="store_true",
+                    help="disable the fluency gate entirely (keeps --distinct-floor, which then "
+                         "costs no forward pass). Use with --flu-monitor-every to calibrate first.")
     ap.add_argument("--distinct-floor", type=float, default=0.5)
     ap.add_argument("--gate-penalty", type=float, default=25.0)
     ap.add_argument("--len-penalty-start", type=int, default=64)
@@ -313,6 +322,8 @@ LEGACY_BUNDLE = {"loss": "ppo", "cispo_eps_max": 5.0, "loss_agg": "token", "zero
 def _resolve_recipe(a):
     """Fill every ScaleRL-variant flag the user did not give (None) from the bundle --recipe selects; --recipe scalerl also
     picks --adv-mode batch unless an advantage mode was given. With --recipe '' and no variant flags nothing changes."""
+    if getattr(a, "no_fluency_floor", False):
+        a.fluency_floor = None
     bundle = SCALERL_BUNDLE if a.recipe == "scalerl" else LEGACY_BUNDLE
     for k, v in bundle.items():
         if getattr(a, k) is None:
@@ -1712,8 +1723,12 @@ def run_trainer(a):
                                  read_layer=getattr(a, "layer", 42),
                                  max_tokens=a.bullet_max_tok, amu_path=a.ar_amu)
         AR_REWARD.build_own(MODEL)
-        _log(tag, "AR reward live: bullets=%d max_tok=%d affine=%s amu=%s"
-                  % (a.bullets, a.bullet_max_tok, bool(a.ar_affine), bool(a.ar_amu)))
+        # The distinct-token fraction needs token ids only. Skip the clean-base logits forward
+        # unless a fluency floor is actually in play, so a distinct-only gate is free.
+        AR_REWARD.need_logp = a.fluency_floor is not None
+        _log(tag, "AR reward live: bullets=%d max_tok=%d affine=%s amu=%s | gates flu=%s dis=%s"
+                  % (a.bullets, a.bullet_max_tok, bool(a.ar_affine), bool(a.ar_amu),
+                     a.fluency_floor, a.distinct_floor))
     if a.fp32_head:   # before the micro-batch search so its +memory is part of the OOM probe
         install_fp32_head(actor)
         _log(tag, "lm_head recomputed in fp32 (ScaleRL precision fix, trainer side; the vLLM sampler stays bf16-head/fp32-softmax)")
@@ -1917,6 +1932,21 @@ def run_trainer(a):
                 gate &= dis >= a.distinct_floor
             r = r - a.gate_penalty * (~gate).float()
             gate_frac = gate.float().mean().item()
+        flu_pct = None
+        if (is_main and a.flu_monitor_every > 0 and step % a.flu_monitor_every == 0
+                and AR_REWARD is not None):
+            # Measure the gate inputs WITHOUT gating on them, so any future floor is set from the
+            # observed distribution. Subsampled because it costs a clean-base forward.
+            _rs = np.random.default_rng(step)
+            _sel = _rs.choice(len(texts), size=min(a.flu_monitor_n, len(texts)), replace=False)
+            _f, _d = AR_REWARD.fluency([texts[int(i)] for i in _sel], actor, tok, need_logp=True)
+            _fq = np.percentile(_f.numpy(), [1, 5, 10, 25, 50, 90])
+            _dq = np.percentile(_d.numpy(), [1, 5, 10, 25, 50, 90])
+            flu_pct = {"flu/p%d" % q: float(v) for q, v in zip([1, 5, 10, 25, 50, 90], _fq)}
+            flu_pct.update({"dis/p%d" % q: float(v) for q, v in zip([1, 5, 10, 25, 50, 90], _dq)})
+            _log(tag, "gate-input percentiles (n=%d) | logp p1/p5/p10/p25/p50/p90 %s | distinct %s"
+                      % (len(_sel), " ".join("%.2f" % v for v in _fq),
+                         " ".join("%.3f" % v for v in _dq)))
         if a.len_penalty_start is not None:
             over = torch.tensor([max(0, len(g) - a.len_penalty_start) for g in gen_ids], dtype=torch.float32)
             r = r - a.len_penalty_per_tok * over * gate.float()
@@ -2000,6 +2030,7 @@ def run_trainer(a):
         log = {"reward/mean": raw_r_all.mean().item(), "reward/std": raw_r_all.std().item(), "reward/max": raw_r_all.max().item(),
                "reward/shaped_mean": r_all.mean().item(), "reward/within_group_std": float(loc[2] / n_groups_all),
                "reward/gate_frac": float(loc[1] / n_groups_all), "reward/trunc_frac": trunc_frac,
+               **(flu_pct or {}),
                "ratio/clipfrac": stats["clipfrac"], "ratio/mean": stats["ratio_mean"],
                "policy/entropy": stats["entropy"], "policy/kl_to_init": stats["kl"], "policy/entropy_coef": a.entropy_coef,
                "policy/sampler_abs_dlogp": stats["sampler_abs_dlogp"], "policy/offpolicy_lag_steps": lag,

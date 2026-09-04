@@ -255,7 +255,7 @@ class ARReward:
         return F.normalize(t, dim=-1)
 
     @torch.no_grad()
-    def fluency(self, texts, actor, tok, batch=64, max_len=128):
+    def fluency(self, texts, actor, tok, batch=64, max_len=128, need_logp=None):
         """-> (mean clean-base logp/token [n], distinct-token fraction [n]).
 
         WHY THIS EXISTS. The geometric reward alone is satisfied by illegible phrases -- measured:
@@ -267,9 +267,22 @@ class ARReward:
 
         Scored on the ACTOR with its adapter DISABLED (the clean base), exactly as maemm's score()
         does -- not on the AR's own backbone, which is truncated and has no lm_head.
+                CALIBRATION, MEASURED 2026-09-04. `logp` here is UNCONDITIONED -- raw text, no prompt,
+        add_special_tokens=False -- so bullet fragments score far lower than conditioned prose
+        would. A floor of -4.0 rejected 99.4% of perfectly legible warm-start rollouts
+        (reward/gate_frac 0.0056), which under batch-normalized advantages is a near-constant
+        offset that cancels while adding variance. Set any floor from percentiles of THIS
+        distribution (see --flu-monitor-every), never from an absolute guess. The distinct-token
+        floor needs no logits at all and measured min 0.706 on good text, so 0.6 is safe.
+
+        need_logp=None follows self.need_logp (default True). When false the logits forward is
+        SKIPPED entirely and logp comes back as zeros -- a sentinel that passes any floor -- so a
+        distinct-only gate costs nothing.
         """
         n = len(texts)
-        logp = torch.full((n,), -20.0)
+        if need_logp is None:
+            need_logp = getattr(self, "need_logp", True)
+        logp = torch.full((n,), -20.0) if need_logp else torch.zeros(n)
         dis = torch.zeros(n)
         valid = [i for i, t in enumerate(texts) if (t or "").strip()]
         if not valid or actor is None:
@@ -284,6 +297,10 @@ class ARReward:
                           add_special_tokens=False).to(self.dev)
                 if enc["input_ids"].shape[1] < 2:
                     continue
+                dis[idxs] = _distinct_fraction(enc["input_ids"],
+                                               enc["attention_mask"]).cpu()
+                if not need_logp:
+                    continue          # distinct fraction needs token ids only, not a forward pass
                 with actor.disable_adapter():
                     logits = actor(**enc).logits[:, :-1].float()
                 tgt = enc["input_ids"][:, 1:]
@@ -294,8 +311,6 @@ class ARReward:
                 # rows with no next-token logprob keep -20 so they FAIL the floor
                 logp[idxs] = torch.where(nm.any(1), mlp,
                                          torch.full_like(mlp, -20.0)).cpu()
-                dis[idxs] = _distinct_fraction(enc["input_ids"],
-                                               enc["attention_mask"]).cpu()
         finally:
             tok.padding_side = prev
         return logp, dis
