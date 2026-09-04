@@ -282,7 +282,22 @@ class ARReward:
         INJECTED with) while the reward compares in J-space. Feeding already-transformed vectors
         here would apply J twice.
         """
-        t = acts.to(self.dev).float() @ self.J.T
+        a_in = acts.to(self.dev).float()
+        # REFUSE unit-scale inputs. amu is a RAW-scale mean, so subtracting it from L2-normalised
+        # activations makes -amu dominate every target: they collapse together and the reward goes
+        # target-blind WITHOUT any error. Measured cost of exactly that bug (rl_disagg was
+        # normalising bank rows for steering): matched 0.064 / permuted 0.062 / delta 0.0016, and a
+        # FIXED string scoring 0.185 -- 3x better than any real readout. This assert is the whole
+        # reason it went unnoticed for two runs, so it stays.
+        if self.amu is not None and a_in.numel():
+            _n = a_in.norm(dim=-1)
+            _med = float(_n.median())
+            if _med < 0.10 * float(self.amu.norm()):
+                raise SystemExit(
+                    "target_space() got activations with median norm %.3f against ||amu||=%.3f: "
+                    "these look L2-NORMALISED, not raw. Pass RAW activations -- injection paths "
+                    "normalise internally, the reward must not." % (_med, float(self.amu.norm())))
+        t = a_in @ self.J.T
         if self.amu is not None:
             t = t - self.amu
         return F.normalize(self._maybe_whiten(t), dim=-1)

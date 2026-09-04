@@ -113,3 +113,50 @@ Matched fell 0.71 -> 0.46 (~35 SE); delta HALVED. Meanwhile the training reward 
 a Modal preemption and must be regenerated -- it is derivable from `all` plus meta's `rho` column,
 so the expensive measurement pass does NOT need repeating. Tiers 0.70/0.75 were never written.
 `rl/verify_dict.py` re-runs the meta-vs-shard row-count check.
+
+---
+
+## 2026-09-04 (later) -- ROOT CAUSE FOUND: the reward was target-blind by construction
+
+`rl_disagg.py` L2-normalised bank rows when building a rollout block (maemm only needs a DIRECTION
+to steer), and those unit vectors were passed to `score(targets_are_raw=True)`. `target_space()`
+computes `J.h - amu` where `amu` is a RAW-scale mean (raw ||h|| ~ 24, ||amu|| = 55.0). Subtracting a
+55-norm mean from a 1-norm vector makes `-amu` dominate, so every target collapses onto ~the same
+direction.
+
+Reproduced exactly, inside the diagnostic harness, by scaling the targets and changing nothing else:
+
+| targets | matched | permuted | delta | CONSTANT string |
+|---|---|---|---|---|
+| raw | 0.3346 | 0.1827 | 0.1520 | 0.0945 |
+| **unit (what the trainer fed)** | **0.0637** | 0.0621 | **0.0016** | **0.1850** |
+| trainer's own instrumentation | 0.0604 | 0.0589 | (r 0.002) | -- |
+
+**The objective was inverted, not merely dead.** With unit targets a FIXED string scores 0.185
+against a genuine readout's 0.064 -- 3:1 in favour of ignoring the activation. The 400-step run's
+collapse onto one fixed bullet (then two) was the *optimal* response. It was never reward hacking,
+and the earlier "basis padding" and "geometric reward is hackable" framings are downstream of this
+one line.
+
+**Why two runs missed it.** Both injection paths normalise internally (`_steer_vec`,
+`make_inject_hook`), so the injected state was always right and rollouts stayed visibly on-topic --
+bank row 4796 ("College at Rose Hill's 21st Annual Arts and Sciences Faculty Day") produced
+"* President's College Lecturer Professor... * during a lecture on Modern European History...".
+Correct readouts plus a meaningless reward looks like a model problem and is a plumbing problem.
+`_verify_injection` cannot catch it: it injects a RANDOM unit vector and only checks the delta
+equals `hnorm*STEER_COEFF*unit(v)`.
+
+### Fix
+* pass RAW rows at both block-builder sites (injection unaffected, reward repaired)
+* `target_space()` now raises if median ||h|| < 0.10*||amu|| -- unit vectors rejected 5.5x over, raw
+  accepted with 4.4x margin. Silence is what cost the day, so the assert stays.
+
+### What this invalidates and what survives
+* INVALID: every reward number from both RL runs, and the reward-based reasoning built on them
+  (including my own "whitening is the fix" framing -- whitening addresses an exploit that only
+  mattered because the real signal was absent).
+* SURVIVES: all `diag_conditioning.py` numbers, which never route through the trainer -- SFT delta
+  0.4768, RL step-50 0.2361, step-200 0.2339. "RL made the lens worse" still holds, now with a
+  mechanism: it was trained against an inverted objective.
+* STILL OPEN, separately: the rollout injects KARVONEN while the SFT and all evals use REPLACE,
+  costing 34% of the delta (0.2298 -> 0.1520). Worth fixing; not the root cause.

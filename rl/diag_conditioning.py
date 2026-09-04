@@ -42,7 +42,8 @@ COLLAPSED = ("* A sphere is unique in that every point on its surface is\n"
 
 @app.function(image=image, volumes={"/vol": vol}, gpu="B200", timeout=7200)
 def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key: str = "W_ridge0.1",
-        temp: float = 0.0, samples: int = 1):
+        temp: float = 0.0, samples: int = 1, probe: str = "", offset: int = 0,
+        inject: str = "replace", unit_targets: bool = False):
     import sys, numpy as np, torch
     sys.path.insert(0, "/root"); sys.path.insert(0, "/root/src")
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -55,7 +56,7 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
     m = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.6-27B", dtype=torch.bfloat16).to(dev).eval()
     actor = PeftModel.from_pretrained(m, ckpt).eval()
     n_lora = sum(1 for k, _ in actor.named_parameters() if "lora" in k)
-    print("[load] %s | %d lora tensors" % (ckpt, n_lora), flush=True)
+    print("[load] %s | %d lora tensors | inject=%s" % (ckpt, n_lora, inject), flush=True)
     assert n_lora > 0, "adapter loaded 0 LoRA tensors"
 
     INJ, LEFT, RIGHT = C.marker_ids(tok)
@@ -72,7 +73,12 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
             return out
         if not bool((ids == INJ).any()):
             return out
-        new = C.inject_at_marker(ids, resid, vec, INJ, LEFT, RIGHT, "replace")
+        # inject= selects the mode. THE TRAINING ROLLOUT USES KARVONEN (rl.py _steer_vec adds
+        # unit(v)*hnorm*STEER_COEFF), while the SFT and every eval so far used REPLACE. inv_core's
+        # own docstring: "A lens must be READ with the mode it was TRAINED with -- the two produce
+        # different block-42 states, so mixing them yields confident garbage." This flag measures
+        # whether that mismatch is what drove the trainer's matched_fit to 0.060.
+        new = C.inject_at_marker(ids, resid, vec, INJ, LEFT, RIGHT, inject)
         return (new,) + tuple(out[1:]) if isinstance(out, tuple) else new
 
     inner.register_forward_pre_hook(_stash, with_kwargs=True)
@@ -87,7 +93,22 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
     assert at.numel() == 1, "prompt needs exactly one marker, found %d" % at.numel()
     assert int(PIDS[int(at[0]) - 1]) == LEFT and int(PIDS[int(at[0]) + 1]) == RIGHT
 
-    H = torch.from_numpy(np.fromfile(HOLDOUT, dtype="float32").reshape(-1, 5120)[:n]).float()
+    # probe= lets the SAME pipeline be pointed at the TRAINING bank instead of the holdout. The
+    # trainer reports matched_fit 0.060 ~= neg_fit 0.059 (no information in the pairing) where this
+    # diagnostic reports matched 0.395 vs permuted 0.181 on holdout rows. If bank rows also give
+    # 0.395 here, the bank is fine and the trainer's readout<->target pairing is broken; if they
+    # give ~0.06, the bank targets themselves are the problem.
+    _src = probe or HOLDOUT
+    _all = np.fromfile(_src, dtype="float32").reshape(-1, 5120)
+    H = torch.from_numpy(_all[offset:offset + n]).float()
+    if unit_targets:
+        # Reproduce rl_disagg lines 1055/1160: the trainer L2-normalises bank rows for steering,
+        # then hands those UNIT vectors to score(targets_are_raw=True), where target_space subtracts
+        # a RAW-scale amu (raw ||h|| ~ 24). If -amu then dominates, every target collapses onto the
+        # same vector and matched ~= negative -- which is what the trainer reports (0.060 / 0.059).
+        H = torch.nn.functional.normalize(H, dim=-1)
+        print("[unit_targets] bank rows L2-normalised, as the trainer does", flush=True)
+    print("[probe] %s rows %d..%d of %d" % (_src, offset, offset + n, _all.shape[0]), flush=True)
     R = ARR.ARReward(AR_DIR, JLENS, AFFINE, device=dev, read_layer=42, max_tokens=12, amu_path=AMU)
     if whiten:
         # Does whitening keep the CONDITIONING (matched - permuted) while killing the target-blind
@@ -138,7 +159,7 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
     def st(x):
         return float(x.mean()), float(x.std() / max(len(x) ** 0.5, 1))
 
-    out = {"ckpt": ckpt, "n": len(texts), "temp": temp, "whiten": whiten or None, "whiten_key": whiten_key if whiten else None,
+    out = {"ckpt": ckpt, "n": len(texts), "temp": temp, "inject": inject, "whiten": whiten or None, "whiten_key": whiten_key if whiten else None,
            "matched": st(r_match), "permuted_roll1": st(r_perm), "permuted_rand": st(r_perm2),
            "constant_collapsed_string": st(r_const),
            "delta_matched_minus_permuted": float(r_match.mean() - r_perm.mean()),
@@ -155,7 +176,7 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
     print("\n  => reward attributable to READING the activation: %.4f"
           % out["delta_matched_minus_permuted"])
     os.makedirs("/vol/diag", exist_ok=True)
-    tag = ckpt.rstrip("/").replace("/vol/", "").replace("/", "_") + ("_whitened" if whiten else "") + ("_T%g" % temp if temp > 0 else "_greedy")
+    tag = ckpt.rstrip("/").replace("/vol/", "").replace("/", "_") + ("_whitened" if whiten else "") + ("_T%g" % temp if temp > 0 else "_greedy") + ("_bank" if probe else "") + ("_" + inject) + ("_unit" if unit_targets else "")
     json.dump(out, open("/vol/diag/conditioning_%s.json" % tag, "w"), indent=1)
     vol.commit()
     return out
@@ -163,5 +184,7 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
 
 @app.local_entrypoint()
 def main(ckpt: str = "/vol/av_sft_4b/final", n: int = 256, whiten: str = "", whiten_key: str = "W_ridge0.1",
-         temp: float = 0.0):
-    run.remote(ckpt=ckpt, n=n, whiten=whiten, whiten_key=whiten_key, temp=temp)
+         temp: float = 0.0, probe: str = "", offset: int = 0, inject: str = "replace",
+         unit_targets: bool = False):
+    run.remote(ckpt=ckpt, n=n, whiten=whiten, whiten_key=whiten_key, temp=temp, probe=probe,
+               offset=offset, inject=inject, unit_targets=unit_targets)

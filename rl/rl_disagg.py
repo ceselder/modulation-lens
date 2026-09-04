@@ -1052,7 +1052,18 @@ def run_rollout(a):
             dirs = F.normalize(torch.randn(Bb, D_MODEL, dtype=torch.float32), dim=-1)
         else:
             idx = _sample_block_idx(rng, eval_rows, n_vecs, Bb, npr_drop.refresh() if npr_drop is not None else None)
-            dirs = F.normalize(torch.from_numpy(np.asarray(bank[idx], dtype=np.float32)), dim=-1)
+            # DO NOT L2-NORMALISE. maemm only ever needed a direction, but the modulation-lens
+            # reward needs the RAW magnitude: score(targets_are_raw=True) -> target_space() computes
+            # J.h - amu, and amu is a RAW-scale mean (raw ||h|| ~ 24). Feeding unit vectors makes
+            # -amu dominate, so EVERY target collapses onto the same vector and the reward goes
+            # target-blind. MEASURED, unit vs raw, same adapter/rows/whitener/temperature:
+            #   unit targets : matched 0.0637 permuted 0.0621 delta 0.0016  CONSTANT 0.1850
+            #   raw  targets : matched 0.3346 permuted 0.1827 delta 0.1520  CONSTANT 0.0945
+            # With unit targets a FIXED string outscores every real readout 3:1 (0.185 vs 0.064) --
+            # the 400-step run's collapse onto basis padding was the optimal response to that, not
+            # reward hacking. Both injection paths (_steer_vec and make_inject_hook) normalise
+            # internally, so passing raw rows changes the reward ONLY, never the injected state.
+            dirs = torch.from_numpy(np.asarray(bank[idx], dtype=np.float32))
         gen_ids, lps, appended, gen_s = _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids,
                                                         key_prefix=f"r{rank}b{blk}")
         n_tok = sum(len(g) for g in gen_ids)
@@ -1157,7 +1168,7 @@ def run_bench_rollout(a):
                 continue
             Bb = max(1, n_seqs // a.group_size)
             idx = eval_rows + np.sort(rng.choice(n_vecs - eval_rows, size=Bb, replace=False))
-            dirs = F.normalize(torch.from_numpy(np.asarray(bank[idx], dtype=np.float32)), dim=-1)
+            dirs = torch.from_numpy(np.asarray(bank[idx], dtype=np.float32))   # raw: see run_rollout
             # warm-up (LoRA load + graph warm) then the timed call
             _generate_block(llm, a, tok, prompt_ids, marker, dirs[: max(1, Bb // 4)], hnorm, lora_req, eos_ids, f"warm{n_seqs}")
             gen_ids, lps, appended, gen_s = _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids, f"bench{n_seqs}")
