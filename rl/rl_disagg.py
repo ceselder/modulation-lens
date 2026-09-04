@@ -1951,6 +1951,13 @@ def run_trainer(a):
                 gate &= dis >= a.distinct_floor
             r = r - a.gate_penalty * (~gate).float()
             gate_frac = gate.float().mean().item()
+        if is_main and AR_REWARD is not None and step % 10 == 0:
+            _ls = getattr(AR_REWARD, "last_stats", {}) or {}
+            _log(tag, "reward terms | scored %s of %d | bullets %.2f | frac_empty %.3f | "
+                      "matched_fit %.4f | neg_fit %.4f"
+                      % (_ls.get("n_scored"), len(texts), _ls.get("mean_bullets", float("nan")),
+                         _ls.get("frac_empty", float("nan")), _ls.get("mean_matched_fit", float("nan")),
+                         _ls.get("mean_neg_fit", float("nan"))))
         flu_pct = None
         if (is_main and a.flu_monitor_every > 0 and step % a.flu_monitor_every == 0
                 and AR_REWARD is not None):

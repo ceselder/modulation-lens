@@ -41,7 +41,8 @@ COLLAPSED = ("* A sphere is unique in that every point on its surface is\n"
 
 
 @app.function(image=image, volumes={"/vol": vol}, gpu="B200", timeout=7200)
-def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key: str = "W_ridge0.1"):
+def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key: str = "W_ridge0.1",
+        temp: float = 0.0, samples: int = 1):
     import sys, numpy as np, torch
     sys.path.insert(0, "/root"); sys.path.insert(0, "/root/src")
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -104,9 +105,15 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
             sub = H[s:s + 8].to(dev)
             HOOK["vec"] = sub
             try:
+                # temp>0 reproduces the TRAINING distribution. ScaleRL requires T=1.0, and the
+                # whitened+contrastive reward came back at 0.002 on step 0 -- if sampled matched
+                # ~= sampled permuted, that reward has no signal to optimise at all and the failure
+                # is the temperature, not the reward space.
                 gen = actor.generate(input_ids=PIDS.unsqueeze(0).expand(sub.shape[0], -1).contiguous(),
                                      attention_mask=torch.ones(sub.shape[0], PLEN, device=dev, dtype=torch.long),
-                                     max_new_tokens=max_new, do_sample=False,
+                                     max_new_tokens=max_new, do_sample=temp > 0,
+                                     temperature=temp if temp > 0 else None,
+                                     top_p=1.0, top_k=0,
                                      pad_token_id=tok.eos_token_id)
             finally:
                 HOOK["vec"] = None
@@ -114,6 +121,12 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
     print("[gen] %d readouts | e.g. %r" % (len(texts), texts[0][:120]), flush=True)
 
     tg = H.to(dev)
+    # ISOLATION TEST for the contrastive path. Here every row holds a DISTINCT activation, so
+    # group_stride=1 makes the negative the next row = a genuinely different target. If this returns
+    # ~= matched - permuted, the contrast arithmetic is correct and any collapse in training is
+    # specific to the repeated-target group layout. If it returns ~0, the arithmetic is the bug.
+    r_contrast = R.score(texts, tg, actor, tok, k=4, max_tok=12,
+                         contrast_negatives=1, contrast_weight=1.0, group_stride=1)
     r_match = R.score(texts, tg, actor, tok, k=4, max_tok=12)
     r_perm = R.score(texts, torch.roll(tg, 1, dims=0), actor, tok, k=4, max_tok=12)
     r_const = R.score([COLLAPSED] * len(texts), tg, actor, tok, k=4, max_tok=12)
@@ -125,12 +138,16 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
     def st(x):
         return float(x.mean()), float(x.std() / max(len(x) ** 0.5, 1))
 
-    out = {"ckpt": ckpt, "n": len(texts), "whiten": whiten or None, "whiten_key": whiten_key if whiten else None,
+    out = {"ckpt": ckpt, "n": len(texts), "temp": temp, "whiten": whiten or None, "whiten_key": whiten_key if whiten else None,
            "matched": st(r_match), "permuted_roll1": st(r_perm), "permuted_rand": st(r_perm2),
            "constant_collapsed_string": st(r_const),
            "delta_matched_minus_permuted": float(r_match.mean() - r_perm.mean()),
+           "score_with_contrast_stride1": [float(r_contrast.mean()), float(r_contrast.std())],
            "sample_readouts": texts[:5]}
     print(json.dumps({k: v for k, v in out.items() if k != "sample_readouts"}, indent=1), flush=True)
+    print("\n  contrast(score with contrast_negatives=1, stride 1) %.4f +- %.4f"
+          % (float(r_contrast.mean()), float(r_contrast.std() / max(len(r_contrast) ** 0.5, 1))))
+    print("  ... expected ~= matched - permuted if the arithmetic is right")
     print("\n  matched   %.4f +- %.4f" % out["matched"])
     print("  permuted  %.4f +- %.4f  (roll-1)" % out["permuted_roll1"])
     print("  permuted  %.4f +- %.4f  (random)" % out["permuted_rand"])
@@ -138,12 +155,13 @@ def run(ckpt: str, n: int = 256, max_new: int = 96, whiten: str = "", whiten_key
     print("\n  => reward attributable to READING the activation: %.4f"
           % out["delta_matched_minus_permuted"])
     os.makedirs("/vol/diag", exist_ok=True)
-    tag = ckpt.rstrip("/").replace("/vol/", "").replace("/", "_") + ("_whitened" if whiten else "")
+    tag = ckpt.rstrip("/").replace("/vol/", "").replace("/", "_") + ("_whitened" if whiten else "") + ("_T%g" % temp if temp > 0 else "_greedy")
     json.dump(out, open("/vol/diag/conditioning_%s.json" % tag, "w"), indent=1)
     vol.commit()
     return out
 
 
 @app.local_entrypoint()
-def main(ckpt: str = "/vol/av_sft_4b/final", n: int = 256, whiten: str = "", whiten_key: str = "W_ridge0.1"):
-    run.remote(ckpt=ckpt, n=n, whiten=whiten, whiten_key=whiten_key)
+def main(ckpt: str = "/vol/av_sft_4b/final", n: int = 256, whiten: str = "", whiten_key: str = "W_ridge0.1",
+         temp: float = 0.0):
+    run.remote(ckpt=ckpt, n=n, whiten=whiten, whiten_key=whiten_key, temp=temp)

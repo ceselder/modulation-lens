@@ -383,6 +383,7 @@ class ARReward:
         # carry. This is the permutation control promoted to being the objective.
         nb = []
         n_t = tg.shape[0]
+        _fits, _negs_all = [], []      # instrumented: which TERM is off when the contrast collapses
         for i, row in enumerate(bl):
             if not row:
                 continue
@@ -402,10 +403,17 @@ class ARReward:
                     _, cn = nnls_exact(B, tg[k_off])
                     negs.append(cn)
                 if negs:
+                    _negs_all.append(sum(negs) / len(negs))
                     cc = cc - contrast_weight * (sum(negs) / len(negs))
             r[i] = cc
+            _fits.append(float(cc))
             nb.append(len(row))
         self.last_stats = {"mean_bullets": float(np.mean(nb)) if nb else 0.0,
+                           "n_scored": len(_fits),
+                           "mean_neg_fit": float(np.mean(_negs_all)) if _negs_all else float("nan"),
+                           "mean_matched_fit": (float(np.mean(_fits) + contrast_weight * np.mean(_negs_all))
+                                                if _negs_all else
+                                                (float(np.mean(_fits)) if _fits else float("nan"))),
                            "frac_empty": float(sum(1 for x in bl if not x) / max(n, 1)),
                            "n_unique_bullets": len(uniq)}
         if with_fluency:
