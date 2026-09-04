@@ -32,6 +32,8 @@ p.add_argument("--temp", type=float, default=0.0)
 p.add_argument("--inject", default="replace")
 p.add_argument("--layer", type=int, default=42)
 p.add_argument("--out", default="")
+p.add_argument("--probe-dim", type=int, default=5120, help="D for raw .f32 probes")
+p.add_argument("--prompt-file", default="", help="override the job text (RL ckpts have no prompt.txt)")
 A = p.parse_args()
 
 dev = "cuda"
@@ -70,9 +72,13 @@ inner.layers[1].register_forward_hook(_inject)
 # chat-wrapped PROMPT_TXT it encodes, so the template MUST be re-applied here with the same kwargs.
 # Encoding the raw text gave 174 tokens vs training's 186, and with no assistant-turn framing
 # greedy decoding emitted EOS immediately: every readout came back as ''.
-_d = A.ckpt if os.path.exists(os.path.join(A.ckpt, "prompt.txt")) \
-    else os.path.dirname(A.ckpt.rstrip("/"))
-job = open(os.path.join(_d, "prompt.txt")).read()
+# RL checkpoints carry no prompt.txt (the prompt came from --prompt-file), so allow an override.
+if A.prompt_file:
+    job = open(A.prompt_file).read()
+else:
+    _d = A.ckpt if os.path.exists(os.path.join(A.ckpt, "prompt.txt")) \
+        else os.path.dirname(A.ckpt.rstrip("/"))
+    job = open(os.path.join(_d, "prompt.txt")).read()
 ptxt = tok.apply_chat_template([{"role": "user", "content": job}], tokenize=False,
                                add_generation_prompt=True, enable_thinking=False)
 PIDS = torch.tensor(tok.encode(ptxt, add_special_tokens=False), device=dev)
@@ -84,7 +90,17 @@ assert _at.numel() == 1, "prompt needs exactly one marker, found %d" % _at.numel
 assert int(PIDS[int(_at[0]) - 1]) == LEFT and int(PIDS[int(_at[0]) + 1]) == RIGHT, \
     "marker neighbours wrong -- the injection would land in the wrong place"
 
-ACT = torch.from_numpy(np.load(A.probe_npy).astype("float32"))[: A.n]
+# The RL bank stores activations as a raw [n, D] float32 blob (.f32), not .npy -- build_bank.py
+# writes it that way because the trainer memory-maps it. Accept both so a checkpoint can be
+# evaluated on the RESERVED holdout rows the RL never trained on.
+if A.probe_npy.endswith(".f32"):
+    _raw = np.fromfile(A.probe_npy, dtype="float32")
+    assert _raw.size % A.probe_dim == 0, ("%s holds %d floats, not a multiple of D=%d"
+                                          % (A.probe_npy, _raw.size, A.probe_dim))
+    _arr = _raw.reshape(-1, A.probe_dim)
+else:
+    _arr = np.load(A.probe_npy).astype("float32")
+ACT = torch.from_numpy(_arr.astype("float32"))[: A.n]
 META = [json.loads(l) for l in open(A.probe_meta)][: A.n] if A.probe_meta else []
 print("[probe] %d activations from %s\n" % (ACT.shape[0], A.probe_npy), flush=True)
 
@@ -105,11 +121,15 @@ with torch.no_grad():
             HOOK["vec"] = None
         for j, t in enumerate(tok.batch_decode(gen[:, PLEN:], skip_special_tokens=True)):
             i = s + j
-            ctx = (META[i].get("ctx", "") if i < len(META) else "")[-90:]
-            mark = (META[i].get("mark", "") if i < len(META) else "")
-            rows.append({"i": i, "readout": t.strip(), "mark": mark, "ctx": ctx})
+            _m = META[i] if i < len(META) else {}
+            # The RL holdout meta names the just-read span `label`; the older probe files use
+            # `mark`. Keep whichever exists, and save enough ctx for a judge (printing stays short).
+            mark = _m.get("mark") or _m.get("label", "")
+            ctx = _m.get("ctx", "")[-700:]
+            rows.append({"i": i, "readout": t.strip(), "mark": mark, "ctx": ctx,
+                         "src_row": _m.get("src_row"), "doc_id": _m.get("doc_id")})
             print("  [%02d] mark=%r\n       ctx ...%s\n       LENS SAYS: %r"
-                  % (i, mark[:44], ctx.replace("\n", " "), t.strip()[:90]), flush=True)
+                  % (i, mark[:44], ctx[-90:].replace("\n", " "), t.strip()[:90]), flush=True)
 if A.out:
     json.dump(rows, open(A.out, "w"), indent=1)
 print("\nAV_READOUT_DONE", flush=True)
