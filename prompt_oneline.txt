@@ -1,0 +1,11 @@
+You are shown an internal activation vector captured from a language model at a single position while it was reading some text. The vector is enclosed in <concept> tags.
+
+<concept>㈜</concept>
+
+Your job: write the short phrase that this state is holding in mind.
+
+How it is judged. Your phrase is placed into a prompt of the form
+  Focus on the following idea: "<your phrase>" while writing the following phrase: "<a fixed unrelated sentence>"
+The model then writes that fixed sentence, and we read its internal state while it does so. You score well when that state matches the state you were given.
+
+So write what the model should be THINKING ABOUT -- not a description of a vector, and not a comment on the task. Natural, fluent English. At most 16 tokens. Output only the phrase.

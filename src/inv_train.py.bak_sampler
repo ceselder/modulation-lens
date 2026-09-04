@@ -1,0 +1,753 @@
+#!/usr/bin/env python3
+"""
+Amortised inverter: activation in, short phrase out. Two modes, one file.
+
+  --mode sft   fit (activation -> the verbatim clause the model had just read)
+  --mode rl    GRPO against the modulation reward, KL to a frozen copy of the starting policy
+
+Replaces nla/train_sft.py + nla/train_rl_self_contained.py + olens_ddp.py, destroyed with the old
+box. Purpose-built rather than a faithful port: only the AV mode of that 1513-line trainer was ever
+used here.
+
+Facts paid for the hard way, encoded below rather than rediscovered:
+  * The reward MUST average the full template grid. A fixed 4-of-16 subset mispriced phrases by
+    +-50-80% and manufactured a 'formulaic family' artifact that vanished on the full grid.
+  * The carrier is a second bias of the same kind, and larger: sd 0.036 / range 0.119 across 8
+    carriers for one phrase-target pair. It rotates per iteration and is constant WITHIN a group,
+    so it cancels in the group-normalised advantage instead of corrupting the ranking.
+  * KL anchors to --policy, NOT to base. At beta 0.03 it grew to 2.8 nats and became 66% of the
+    objective while reward flattened; the falling grad norm that looked like stability was the two
+    gradients cancelling. Default here is 0.001.
+  * Warm start matters: RL from a policy trained on a different task spends its early steps
+    unlearning that task while the KL term pulls it back.
+  * No length penalty. Length grew 5 -> 9 tokens on its own once the reward was correct.
+"""
+import argparse, json, math, os, random, re, time
+import numpy as np
+import pyarrow.parquet as pq
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from peft import LoraConfig, PeftModel, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+import inv_core as C
+
+p = argparse.ArgumentParser()
+p.add_argument("--mode", choices=["sft", "rl"], required=True)
+p.add_argument("--base", default="Qwen/Qwen3.6-27B")
+p.add_argument("--policy", default="", help="adapter dir; blank = fresh LoRA (sft only)")
+p.add_argument("--data", default="/workspace/inv/data/prose_L42.parquet")
+p.add_argument("--whitener", default="/workspace/inv/data/meansub/natural_whitener_jspace.npz")
+p.add_argument("--probe-npy", default="", help="fixed held-out activations")
+p.add_argument("--probe-meta", default="", help="jsonl with {mark,ctx} per probe row")
+p.add_argument("--layer", type=int, default=42)
+p.add_argument("--inject", default="replace", choices=["replace", "karvonen"],
+               help="marker injection recipe; a lens must be READ with the mode it was TRAINED with")
+p.add_argument("--adv-norm", default="std", choices=["std", "none", "batch"],
+               help="std=vanilla GRPO (per-group std). none=Dr. GRPO, drops the std entirely. "
+                    "batch=divide by the BATCH-mean std: removes the per-group difficulty bias "
+                    "Dr. GRPO objects to WITHOUT the ~30x global rescale that 'none' causes, "
+                    "which would otherwise confound the comparison via grad clipping.")
+p.add_argument("--loss-agg", default="seq", choices=["seq", "token"],
+               help="seq=token-mean per micro-batch, sequence-weighted across (the original). "
+                    "token=DAPO token-level: one sum over every token in the batch / total "
+                    "tokens, so long sequences are not down-weighted per token.")
+p.add_argument("--train-bullets", default="",
+               help="SFT on mined 4-bullet targets: jsonl of {i, bullets:[...]} from "
+                    "mine_bullets.py. The target text becomes the '* '-prefixed lines, which is "
+                    "what teaches the policy to emit bullets at all -- without it, a single-phrase "
+                    "policy ignores the bullets instruction and NNLS degenerates to one atom.")
+p.add_argument("--bullets", type=int, default=1,
+               help="N>1: the policy writes N bullets instead of one phrase. Each bullet is read "
+                    "through the modulation grid separately and the reward is how well a "
+                    "NON-NEGATIVE least-squares combination of those N vectors reconstructs the "
+                    "target. Lets the lens DECOMPOSE a mixed activation instead of packing "
+                    "everything into one phrase (which is what the slash-lists were doing).")
+p.add_argument("--bullet-max-tok", type=int, default=20,
+               help="max tokens PER BULLET. --max-new is a GLOBAL cap on the whole completion, so a "
+                    "generous global budget lets bullets sprawl (at max_new 160 the policy wrote "
+                    "len ~105 = ~26 tok/bullet). This truncates each bullet at parse time AND caps "
+                    "the grid read at the same length, so the reward can never score more of a "
+                    "bullet than we intend to allow.")
+p.add_argument("--read-batch", type=int, default=192,
+               help="sequences per grid-read forward. Was hardcoded 48; the grid read over ~256 unique bullets x 36 cells dominates four-bullet step time.")
+p.add_argument("--lam-div", type=float, default=0.0,
+               help="reward complementary bullets EXPLICITLY: + lam_div * (atoms NNLS actually "
+                    "uses / bullets written). Diversity currently pays only via the composition "
+                    "gain, measured at just +0.012 cos, which is far too weak a gradient for RL to "
+                    "find it -- the bullets stay rephrasings and NNLS zeroes three of four. This "
+                    "makes 'use all four' a first-class objective. NOT a free lunch: 4 unrelated "
+                    "bullets would score n_used=1.0 but wreck the reconstruction term, so it is a "
+                    "trade-off with the real reward rather than a bypass of it.")
+p.add_argument("--no-jacobian", action="store_true",
+               help="score in RAW layer-42 space: no J on either side. Different geometry, so it "
+                    "gets its own PMU cache (the grid signature alone would collide).")
+p.add_argument("--ridge", default="0.1")
+p.add_argument("--whiten", type=int, default=0,
+               help="1 = whitened cosine (Sigma^-1/2 on both sides), 0 = PLAIN cosine. Default 0: "
+                    "plain cosine is what was asked for, and -- more importantly -- it is the metric "
+                    "grid v2 was SELECTED under. The 107-template screen, the intensity ablation and "
+                    "the relational test all used plain cosine, so optimising a whitened reward "
+                    "would optimise a different objective than the one the templates were chosen "
+                    "for. Centring (the two fixed means) is kept either way; that is the "
+                    "first-moment fix and is load-bearing -- one shared mean puts a blank string at "
+                    "0.259, two puts it at 0.008.")
+p.add_argument("--n-pool", type=int, default=60000)
+p.add_argument("--train-npy", default="",
+               help="Train on a FIXED activation array instead of the harvested pool. For the "
+                    "overfit smoke test: hammer a handful of targets until the objective is "
+                    "saturated, to see what maximal performance looks like and whether the "
+                    "readouts stay legible in the limit. No held-out by design.")
+p.add_argument("--min-words", type=int, default=4,
+               help="Drop labels shorter than this. Measured at n=200 whitened: 1-3 word labels "
+                    "win against 24 wrong labels only 28%% of the time versus 54-64%% for longer "
+                    "ones, and score 0.021 against 0.063 -- they are connective filler ('In turn,', "
+                    "'and the environment.') carrying almost none of the state. They are 28.5%% of "
+                    "the harvest.")
+p.add_argument("--max-new", type=int, default=16)
+p.add_argument("--lora-r", type=int, default=64)
+p.add_argument("--lora-alpha", type=int, default=16)
+p.add_argument("--lr", type=float, default=3e-5)
+p.add_argument("--steps", type=int, default=938)
+p.add_argument("--batch", type=int, default=16, help="sft: sequences; rl: activations per step")
+p.add_argument("--accum", type=int, default=4)
+p.add_argument("--group", type=int, default=16, help="rl: rollouts per activation")
+p.add_argument("--kl-beta", type=float, default=0.001)
+p.add_argument("--lam-text", type=float, default=1.0,
+               help="Weight on the SUFFICIENCY term. The activation-matching term alone is "
+                    "underspecified: nothing in it requires the phrase to mean anything to a "
+                    "reader, which is why RL found 'not pizza related wording but related <topic>' "
+                    "-- phrases that satisfy the geometry (margin 0.275, BETTER than the good "
+                    "checkpoint's 0.221) while being illegible. 0 disables it.")
+p.add_argument("--text-batch", type=int, default=48, help="sequences per sufficiency forward")
+p.add_argument("--copy-penalty", type=float, default=0.5,
+               help="Subtract this times the token-level Jaccard overlap between the phrase and its "
+                    "own source span. The sufficiency term is maximised by quoting the span "
+                    "verbatim, and copying is already the SFT failure mode, so it needs a "
+                    "counterweight.")
+p.add_argument("--train-labels", default="",
+               help="jsonl with a 'ctx' or 'label' per row, aligned with --train-npy. Needed for "
+                    "the sufficiency term in overfit mode.")
+p.add_argument("--temp", type=float, default=1.0)
+p.add_argument("--micro", type=int, default=4)
+p.add_argument("--n-carriers", type=int, default=6)
+p.add_argument("--eval-every", type=int, default=10)
+p.add_argument("--save-every", type=int, default=25)
+p.add_argument("--save-dir", default="/workspace/inv/ckpts/run")
+p.add_argument("--wandb-project", default="olens-grpo")
+p.add_argument("--wandb-name", default="inv")
+p.add_argument("--seed", type=int, default=0)
+A = p.parse_args()
+
+RANK = int(os.environ.get("RANK", "0"))
+WORLD = int(os.environ.get("WORLD_SIZE", "1"))
+LOCAL = int(os.environ.get("LOCAL_RANK", "0"))
+if WORLD > 1:
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(LOCAL)
+dev = "cuda:%d" % LOCAL if WORLD > 1 else "cuda"
+IS0 = RANK == 0
+random.seed(A.seed + RANK)
+torch.manual_seed(A.seed)
+os.makedirs(A.save_dir, exist_ok=True)
+
+tok = AutoTokenizer.from_pretrained(A.base)
+INJ, LEFT, RIGHT = C.marker_ids(tok)
+base = AutoModelForCausalLM.from_pretrained(A.base, dtype=torch.bfloat16).to(dev)
+if A.policy:
+    model = PeftModel.from_pretrained(base, A.policy, adapter_name="default", is_trainable=True)
+    model.load_adapter(A.policy, adapter_name="reference")   # frozen KL anchor = the START policy
+    model.set_adapter("default")
+else:
+    model = get_peft_model(base, LoraConfig(
+        r=A.lora_r, lora_alpha=A.lora_alpha, lora_dropout=0.0, bias="none",
+        use_rslora=True, task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"]))
+model.config.use_cache = True
+inner = model.base_model.model.model
+
+HOOK = {"vec": None, "ids": None}
+L42 = {}
+
+
+def _stash(mod, a, kw):
+    ids = kw.get("input_ids")
+    if ids is None and a:
+        ids = a[0]
+    HOOK["ids"] = ids
+
+
+def _inject(mod, a, out):
+    resid = out[0] if isinstance(out, tuple) else out
+    ids, vec = HOOK["ids"], HOOK["vec"]
+    if vec is None or ids is None or tuple(ids.shape) != tuple(resid.shape[:-1]):
+        return out
+    if not bool((ids == INJ).any()):
+        return out                      # decode steps carry no marker
+    new = C.inject_at_marker(ids, resid, vec, INJ, LEFT, RIGHT, A.inject)
+    return (new,) + tuple(out[1:]) if isinstance(out, tuple) else new
+
+
+inner.register_forward_pre_hook(_stash, with_kwargs=True)
+inner.layers[1].register_forward_hook(_inject)
+inner.layers[A.layer].register_forward_hook(
+    lambda m, i, o: L42.__setitem__("h", o[0] if isinstance(o, tuple) else o))
+
+JOB = ("You are shown an internal activation vector captured from a language model at a single "
+       "position while it was reading some text. The vector is enclosed in <concept> tags.\n\n"
+       "<concept>%s</concept>\n\n"
+       "Your job: write the short phrase that this state is holding in mind.\n\n"
+       "How it is judged. Your phrase is placed into a prompt of the form\n"
+       '  Focus on the following idea: "<your phrase>" while writing the following phrase: '
+       '"<a fixed unrelated sentence>"\n'
+       "The model then writes that fixed sentence, and we read its internal state while it does "
+       "so. You score well when that state matches the state you were given.\n\n"
+       "So write what the model should be THINKING ABOUT -- not a description of a vector, and not "
+       "a comment on the task. Natural, fluent English. At most %d tokens. Output only the phrase."
+       % (C.INJ_CHAR, A.max_new))
+if A.bullets > 1:
+    # The state is a MIXTURE, so ask for parts rather than one phrase. The reward composes them by
+    # non-negative least squares, so overlapping or partial parts are fine.
+    JOB = JOB.replace(
+        "Your job: write the short phrase that this state is holding in mind.",
+        "Output %d bullet points, each starting with '*', describing the separate "
+        "things this state is holding in mind. They are combined afterwards, so each bullet "
+        "should be a DIFFERENT part of the state rather than a rephrasing of the others."
+        % A.bullets)
+    JOB = JOB.replace("Output only the phrase.",
+                      "Output only the %d bullet lines: no preamble, no summary line, no "
+                      "trailing commentary." % A.bullets)
+    # The middle paragraph still described scoring ONE phrase while the task asked for N lines.
+    # That contradiction is what made the policy emit a summary claim and THEN the bullets.
+    if A.bullet_max_tok:
+        # The prompt quoted --max-new, the GLOBAL budget, as the per-phrase cap. The reward reads
+        # only the first --bullet-max-tok tokens of each line, so quoting max_new invited the
+        # policy to spend the whole budget on line 1 and get truncated on line 4.
+        _old = "At most %d tokens." % A.max_new
+        assert _old in JOB, "per-line length patch: could not find %r" % _old
+        JOB = JOB.replace(_old, "At most %d tokens PER LINE -- short, concrete lines leave room "
+                                "for the other lines and compose better." % A.bullet_max_tok)
+    JOB = JOB.replace("How it is judged. Your phrase is placed into a prompt of the form",
+                      "How it is judged. EACH of your lines is placed separately into a prompt of "
+                      "the form")
+    JOB = JOB.replace('Focus on the following idea: "<your phrase>"',
+                      'Focus on the following idea: "<one of your lines>"')
+    JOB = JOB.replace("You score well when that state matches the state you were given.",
+                      "The %d resulting states are then added together with non-negative weights, "
+                      "and you score well when that SUM matches the state you were given -- so the "
+                      "lines should cover DIFFERENT parts of it." % A.bullets)
+
+PROMPT_TXT = tok.apply_chat_template([{"role": "user", "content": JOB}], tokenize=False,
+                                     add_generation_prompt=True, enable_thinking=False)
+PIDS = torch.tensor(tok.encode(PROMPT_TXT, add_special_tokens=False), device=dev)
+PLEN = PIDS.numel()
+_at = (PIDS == INJ).nonzero().flatten()
+assert _at.numel() == 1, "prompt needs exactly one marker, found %d" % _at.numel()
+_k = int(_at[0])
+assert int(PIDS[_k - 1]) == LEFT and int(PIDS[_k + 1]) == RIGHT, "marker neighbours wrong"
+if IS0:
+    print("[prompt] %d tokens, marker at %d, neighbours verified | inject=%s" % (PLEN, _k, A.inject), flush=True)
+
+# ---- data ----
+pf = pq.ParquetFile(A.data)
+cols = [f.name for f in pf.schema_arrow]
+acc_v, acc_l = [], []
+for b in pf.iter_batches(batch_size=4096, columns=["activation_vector", "label"]):
+    d = b.to_pydict()
+    acc_v.append(np.array(d["activation_vector"], dtype="float32"))
+    acc_l.extend(d["label"])
+    if sum(len(x) for x in acc_v) >= A.n_pool:
+        break
+if A.train_npy:
+    ACTS = torch.from_numpy(np.load(A.train_npy).astype("float32"))
+    LABELS = [""] * ACTS.shape[0]
+    if A.train_labels:
+        _rows = [json.loads(l) for l in open(A.train_labels) if l.strip()]
+        LABELS = [(_rows[i].get("label") or _rows[i].get("ctx") or "")
+                  for i in range(min(len(_rows), ACTS.shape[0]))]
+        LABELS += [""] * (ACTS.shape[0] - len(LABELS))
+    if IS0:
+        print("[data] OVERFIT MODE: %d fixed activations from %s"
+              % (ACTS.shape[0], A.train_npy), flush=True)
+elif A.train_bullets:
+    # The miner indexes the RAW parquet order; the branch below applies a min_words filter first.
+    # Reusing `i` across those two orderings would pair activations with the WRONG bullets and
+    # still look like it was training, so index the raw array directly and assert the range.
+    _rows = []
+    for _p in A.train_bullets.split(","):
+        _p = _p.strip()
+        if _p:
+            _rows += [json.loads(l) for l in open(_p) if l.strip()]
+    _Vall = np.concatenate(acc_v)
+    _idx = [int(r["i"]) for r in _rows]
+    if not _idx or max(_idx) >= _Vall.shape[0]:
+        raise SystemExit("mined index %d out of range for %d pooled activations -- raise --n-pool"
+                         % (max(_idx) if _idx else -1, _Vall.shape[0]))
+    ACTS = torch.from_numpy(_Vall[_idx])
+    LABELS = ["\n".join("* " + b for b in r["bullets"]) for r in _rows]
+    _keep = _idx
+    if IS0:
+        _nb = [len(r["bullets"]) for r in _rows]
+        _gain = [r.get("compose_cos", 0) - r.get("single_cos", 0) for r in _rows
+                 if "compose_cos" in r]
+        print("[data] BULLET SFT: %d mined rows | mean bullets %.2f | mean compose-minus-single "
+              "cos gain %+.4f" % (len(_rows), float(np.mean(_nb)),
+                                  float(np.mean(_gain)) if _gain else float("nan")), flush=True)
+else:
+    _V = np.concatenate(acc_v)
+    _keep = [i for i, l in enumerate(acc_l) if len(l.split()) >= A.min_words]
+    ACTS = torch.from_numpy(_V[_keep][: A.n_pool])
+    LABELS = [acc_l[i] for i in _keep][: A.n_pool]
+if IS0:
+    print("[data] %d rows kept of %d (min_words=%d dropped %.1f%%)"
+          % (ACTS.shape[0], len(acc_l), A.min_words,
+             100.0 * (1 - len(_keep) / max(1, len(acc_l)))), flush=True)
+
+J = C.load_jlens(A.layer, dev)
+MU, Wm = C.load_whitener(A.whitener, A.ridge, dev)
+AMU = ACTS.mean(0).to(dev) @ J.T           # target-side centre: the pool's own mean
+if A.no_jacobian:
+    J = torch.eye(J.shape[0], device=dev, dtype=J.dtype)   # identity == no Jacobian
+GRID = C.Grid(tok, C.TEMPLATES_RECOVERED, C.CARRIERS_RECOVERED[: A.n_carriers], A.layer, J, dev)
+_GSIG = GRID.sig()[:10] + ("_noJ" if A.no_jacobian else "")
+PMU_PATH = os.path.join(A.save_dir, "pmu_%s.npy" % _GSIG)   # keyed to the GRID, not just the dir
+
+
+def get_pmu():
+    if os.path.exists(PMU_PATH):
+        return torch.tensor(np.load(PMU_PATH), device=dev)
+    HOOK["vec"] = None
+    with model.disable_adapter():
+        v = GRID.prompt_mean(model, L42, n=64)
+    if IS0:
+        np.save(PMU_PATH, v.cpu().numpy())
+        json.dump({"grid_sig": _GSIG, "n_tpl": GRID.n_tpl, "n_car": GRID.n_car,
+                   "layer": A.layer, "pmu_norm": float(v.norm()),
+                   "templates": list(C.TEMPLATES_RECOVERED)},
+                  open(PMU_PATH.replace(".npy", ".json"), "w"), indent=1)
+    return v
+
+
+def whiten_t(x):
+    v = (x @ J.T) - AMU if x.shape[-1] == C.D_MODEL else x - AMU
+    return v @ Wm.T if A.whiten else v
+
+
+BULLET_STATS = {}
+
+
+_BULLET_RE = re.compile(r"^\s*(?:[*\u2022\-\u2013]|\d+[.)])\s+")
+
+
+def _trunc_tok(x, ntok):
+    """Cut a bullet to ntok tokens. Done on TOKENS, not characters, because the grid read and the
+    reward both operate on tokens -- a character cut would leave a bullet the read still truncates."""
+    ids = tok(x, add_special_tokens=False).input_ids
+    return tok.decode(ids[:ntok]).strip() if len(ids) > ntok else x
+
+
+def split_bullets(text, n, max_tok=0):
+    """-> up to n non-empty bullets. Accepts '* ', '- ', bullet chars, or bare lines, and falls
+    back to the whole string as ONE bullet -- a policy that ignores the format then still gets a
+    valid (weaker) reward instead of a crash or a spurious zero."""
+    lines = [l.strip() for l in str(text).splitlines() if l.strip()]
+    marked = [l for l in lines if _BULLET_RE.match(l)]
+    # A preamble ("<claim>\n* a\n* b\n* c\n* d") used to occupy slot 1, so the composition scored a
+    # SUMMARY plus three parts and silently dropped the fourth real bullet. When any line carries an
+    # explicit marker, use only the marked lines.
+    out = [_BULLET_RE.sub("", l).strip() for l in (marked if marked else lines)[:n]]
+    out = [l for l in out if l] or [str(text).strip() or "the"]
+    if max_tok:
+        out = [_trunc_tok(b, max_tok) or "the" for b in out]
+    return out
+
+
+def nnls_small(B, t):
+    """Exact non-negative least squares for a small number of atoms, via active-set enumeration.
+
+    B [n,d] atom rows, t [d] target -> w [n] >= 0 minimising ||t - w@B||. For n<=4 there are at
+    most 15 supports, so enumerating them and keeping the lowest-residual FEASIBLE one is exact --
+    no iterative solver and no scipy (not installed here). Clamping an unconstrained lstsq would
+    not be exact, and negative coefficients are meaningless for a readout: "minus <phrase>" is not
+    something a lens can report.
+    """
+    n = B.shape[0]
+    best_w, best_res = None, float("inf")
+    for mask in range(1, 1 << n):
+        idx = [k for k in range(n) if (mask >> k) & 1]
+        S = B[idx].T
+        sol = torch.linalg.lstsq(S, t.unsqueeze(1)).solution.squeeze(1)
+        if bool((sol < -1e-8).any()):
+            continue
+        res = float((t - S @ sol).norm())
+        if res < best_res:
+            best_res = res
+            w = torch.zeros(n, device=B.device, dtype=B.dtype)
+            w[torch.tensor(idx, device=B.device)] = sol
+            best_w = w
+    return best_w if best_w is not None else torch.zeros(n, device=B.device, dtype=B.dtype)
+
+
+def score_strings(strings, targets_w, carrier=None, max_tok=None):
+    """-> {string: centred vec}. Averages the WHOLE grid (all templates x all carriers): one
+    carrier is a noisy estimate of the modulation vector, and a clean extraction is the point."""
+    HOOK["vec"] = None
+    with model.disable_adapter():                  # score with plain base weights
+        v = GRID.read_all(model, strings, L42,
+                          max_tok=(max_tok or A.max_new), batch=A.read_batch)
+    return {s: (((v[s] - PMU) @ Wm.T) if A.whiten else (v[s] - PMU)) for s in strings}
+
+
+if IS0:
+    import wandb
+    wandb.init(project=A.wandb_project, name=A.wandb_name, config=vars(A), resume="allow")
+
+# ======================================================================== SFT
+if A.mode == "sft":
+    PMU = None
+    opt = torch.optim.AdamW([q for q in model.parameters() if q.requires_grad], lr=A.lr)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=A.lr, total_steps=A.steps,
+                                                pct_start=0.05, anneal_strategy="cos")
+    order = list(range(ACTS.shape[0]))
+    random.shuffle(order)
+    ptr = 0
+    for step in range(1, A.steps + 1):
+        opt.zero_grad(set_to_none=True)
+        tot, ntok = 0.0, 0
+        for _ in range(A.accum):
+            rows = []
+            for _ in range(A.batch):
+                if ptr >= len(order):
+                    random.shuffle(order)
+                    ptr = 0
+                rows.append(order[ptr])
+                ptr += 1
+            resp = [tok.encode(LABELS[i] + (tok.eos_token or ""), add_special_tokens=False)[:A.max_new + 1]
+                    for i in rows]
+            T = PLEN + max(len(r) for r in resp)
+            ids = torch.full((len(rows), T), tok.eos_token_id, device=dev, dtype=torch.long)
+            lab = torch.full((len(rows), T), -100, device=dev, dtype=torch.long)
+            for j, r in enumerate(resp):
+                ids[j, :PLEN] = PIDS
+                ids[j, PLEN:PLEN + len(r)] = torch.tensor(r, device=dev)
+                lab[j, PLEN:PLEN + len(r)] = torch.tensor(r, device=dev)
+            HOOK["vec"] = ACTS[rows].to(dev).float()
+            out = model(input_ids=ids)
+            HOOK["vec"] = None
+            lg = out.logits[:, :-1].float()
+            tg = lab[:, 1:]
+            loss = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tg.reshape(-1),
+                                   ignore_index=-100)
+            (loss / A.accum).backward()
+            tot += float(loss) * int((tg != -100).sum())
+            ntok += int((tg != -100).sum())
+        gn = torch.nn.utils.clip_grad_norm_([q for q in model.parameters() if q.requires_grad], 1.0)
+        opt.step()
+        sched.step()
+        ce = tot / max(1, ntok)
+        if IS0:
+            wandb.log({"sft/loss": ce, "sft/ppl": math.exp(min(20, ce)),
+                       "sft/lr": sched.get_last_lr()[0], "sft/grad": float(gn)}, step=step)
+            if step % 25 == 0 or step == 1:
+                print("step %04d | loss %.4f | ppl %.2f | lr %.2e | grad %.3f"
+                      % (step, ce, math.exp(min(20, ce)), sched.get_last_lr()[0], float(gn)),
+                      flush=True)
+        if step % A.save_every == 0 and IS0:
+            model.save_pretrained("%s/iter_%06d" % (A.save_dir, step))
+    if IS0:
+        model.save_pretrained("%s/final" % A.save_dir)
+        print("SFT_DONE", flush=True)
+
+# ======================================================================== RL
+else:
+    PMU = get_pmu()
+    if IS0:
+        print("[obj] |PMU| %.2f [grid %s] | %d templates x %d carriers ALL-AVERAGED per rollout | KL beta %.4f | adv=%s loss=%s bullets=%d lam_div=%.3f%s"
+              % (float(PMU.norm()), _GSIG, GRID.n_tpl, GRID.n_car, A.kl_beta, A.adv_norm,
+                 A.loss_agg, A.bullets, A.lam_div,
+                 " NO-JACOBIAN" if A.no_jacobian else ""), flush=True)
+    PROBE = (torch.from_numpy(np.load(A.probe_npy).astype("float32"))
+             if A.probe_npy else ACTS[-32:].clone())
+    PMETA = ([json.loads(l) for l in open(A.probe_meta)] if A.probe_meta else [])
+    TRAIN = [q for q in model.parameters() if q.requires_grad]
+    opt = torch.optim.AdamW(TRAIN, lr=A.lr)
+
+    READER = ('A language model was reading some text. Someone who could see its internal '
+              'state describes what it had in mind as: "%s"\n\nThe text it was reading was:')
+
+    @torch.no_grad()
+    def sufficiency(phrases, spans):
+        """s[p][j] = mean log P(spans[j] | reader_prompt(p)) under the FROZEN base model.
+
+        A language-level test, so it cannot be won geometrically: a phrase only raises the
+        likelihood of a span if it actually carries information about it. Boilerplate contributes
+        nothing, which is exactly the property the activation term lacks.
+        """
+        pairs, meta = [], []
+        for pi, ph in enumerate(phrases):
+            pre = tok(READER % ph, add_special_tokens=False).input_ids
+            for sj, sp in enumerate(spans):
+                st = tok(" " + sp.strip(), add_special_tokens=False).input_ids[:32]
+                if st:
+                    pairs.append((pre, st))
+                    meta.append((pi, sj))
+        out = np.zeros((len(phrases), len(spans)), dtype="float32")
+        with model.disable_adapter():
+            for a0 in range(0, len(pairs), A.text_batch):
+                blk = pairs[a0:a0 + A.text_batch]
+                T = max(len(x) + len(y) for x, y in blk)
+                ids = torch.full((len(blk), T), tok.eos_token_id, device=dev, dtype=torch.long)
+                msk = torch.zeros((len(blk), T), device=dev, dtype=torch.bool)
+                for k, (x, y) in enumerate(blk):
+                    ids[k, :len(x)] = torch.tensor(x, device=dev)
+                    ids[k, len(x):len(x) + len(y)] = torch.tensor(y, device=dev)
+                    msk[k, len(x):len(x) + len(y)] = True
+                HOOK["vec"] = None
+                lg = torch.log_softmax(model(input_ids=ids).logits[:, :-1].float(), -1)
+                tg, mm = ids[:, 1:], msk[:, 1:]
+                lp = lg.gather(2, tg.unsqueeze(2)).squeeze(2)
+                per = (lp * mm).sum(1) / mm.sum(1).clamp(min=1)
+                for k in range(len(blk)):
+                    pi, sj = meta[a0 + k]
+                    out[pi, sj] = float(per[k])
+        return out
+
+
+    def _jac(a, b):
+        ta = set(tok(a, add_special_tokens=False).input_ids)
+        tb = set(tok(b, add_special_tokens=False).input_ids)
+        return len(ta & tb) / max(1, len(ta | tb))
+
+
+    @torch.no_grad()
+    def rollout(acts, G):
+        texts = [[] for _ in range(acts.shape[0])]
+        per = max(1, 256 // G)
+        for s in range(0, acts.shape[0], per):
+            sub = acts[s:s + per].to(dev).float()
+            B = sub.shape[0] * G
+            HOOK["vec"] = sub.repeat_interleave(G, 0)
+            try:
+                gen = model.generate(input_ids=PIDS.unsqueeze(0).expand(B, -1).contiguous(),
+                                     attention_mask=torch.ones(B, PLEN, device=dev, dtype=torch.long),
+                                     max_new_tokens=A.max_new, do_sample=True, temperature=A.temp,
+                                     top_p=1.0, top_k=0, pad_token_id=tok.eos_token_id)
+            finally:
+                HOOK["vec"] = None
+            for j, t in enumerate(tok.batch_decode(gen[:, PLEN:], skip_special_tokens=True)):
+                texts[s + j // G].append(t.strip() or " the")
+        return texts
+
+    def reward(acts, texts, carrier, spans=None):
+        """r_state + lam_text * r_text - copy_penalty * overlap.
+
+        r_state: does holding the phrase in mind reproduce the activation.
+        r_text : does the phrase specifically raise the likelihood of ITS OWN source span, relative
+                 to the other spans in the batch. This is what makes maxing the objective out
+                 trustworthy -- the geometric term alone is satisfied by illegible phrases.
+        """
+        flat = [(i, t) for i, per in enumerate(texts) for t in per]
+        tg = {}
+        for i in range(len(texts)):
+            b = whiten_t(acts[i].to(dev).float())
+            tg[i] = b / b.norm().clamp(min=1e-8)
+
+        if A.bullets > 1:
+            # Each completion is a set of bullets. Read every bullet through the grid, then let
+            # non-negative least squares choose how to ADD them up; the reward is how well that
+            # composition reconstructs the target. The lens may therefore decompose a mixed state
+            # into parts instead of cramming it into one phrase.
+            bl = {t: split_bullets(t, A.bullets, A.bullet_max_tok) for _, t in flat}
+            ub = sorted({b for bs in bl.values() for b in bs})
+            cb = score_strings(ub, None, carrier, max_tok=A.bullet_max_tok)
+            R, nb_used, nb_nz, nb_zero = [], [], [], []
+            for i, t in flat:
+                B = torch.stack([cb[b] for b in bl[t]])
+                w = nnls_small(B, tg[i])
+                recon = w @ B
+                rn = recon.norm()
+                # w=0 means every bullet pointed AWAY from the target, so the best non-negative
+                # composition is nothing. Reward 0 is correct, but it is a FLAT region: such
+                # rollouts are indistinguishable inside a GRPO group. Track how often it happens.
+                _r = float((recon @ tg[i]) / rn) if float(rn) > 1e-8 else 0.0
+                if A.lam_div:
+                    _r += A.lam_div * (int((w > 1e-6).sum()) / max(len(bl[t]), 1))
+                R.append(_r)
+                nb_zero.append(int(float(rn) <= 1e-8))
+                nb_used.append(len(bl[t]))
+                nb_nz.append(int((w > 1e-6).sum()))
+            BULLET_STATS.clear()
+            BULLET_STATS.update({"bullets/mean_written": float(np.mean(nb_used)),
+                                 "bullets/mean_used_by_nnls": float(np.mean(nb_nz)),
+                                 "bullets/frac_all_used": float(np.mean(
+                                     [a == b for a, b in zip(nb_nz, nb_used)])),
+                                 "bullets/frac_zero_recon": float(np.mean(nb_zero))})
+            return np.array(R, dtype="float32")
+
+        uniq = sorted({t for _, t in flat})
+        cand = score_strings(uniq, None, carrier)
+        st = {}
+        for t in uniq:
+            a = cand[t]
+            st[t] = {i: float((a @ tg[i]) / a.norm().clamp(min=1e-8)) for i in tg}
+        SEM = None
+        if A.lam_text and spans and any(x.strip() for x in spans):
+            SEM = sufficiency(uniq, spans)
+            ui = {t: k for k, t in enumerate(uniq)}
+        R = []
+        for i, t in flat:
+            r = st[t][i]
+            if SEM is not None:
+                row = SEM[ui[t]]
+                others = [row[j] for j in range(len(spans)) if j != i]
+                r = r + A.lam_text * (row[i] - (float(np.mean(others)) if others else 0.0))
+                if A.copy_penalty:
+                    r = r - A.copy_penalty * _jac(t, spans[i])
+            R.append(r)
+        return np.array(R, dtype="float32")
+
+    for step in range(A.steps):
+        carrier = None                       # every rollout is scored on the full grid
+        nb = min(A.batch, ACTS.shape[0])
+        # One SHARED rng across ranks (they are seeded differently at startup, line ~110),
+        # so [RANK::WORLD] shards ONE batch of nb distinct activations. Previously each rank
+        # drew its own independent sample and sliced that, making --batch mean 'nb draws with
+        # replacement across ranks' rather than nb distinct activations per step.
+        idx = random.Random(A.seed * 100003 + step).sample(range(ACTS.shape[0]), nb)[RANK::WORLD]
+        Ab = ACTS[idx]
+        texts = rollout(Ab, A.group)
+        R = reward(Ab, texts, carrier, [LABELS[i] for i in idx])
+        Rg = R.reshape(len(idx), A.group)
+        cen = Rg - Rg.mean(1, keepdims=True)
+        if A.adv_norm == "std":
+            adv = cen / (Rg.std(1, keepdims=True) + 1e-6)
+        elif A.adv_norm == "none":
+            adv = cen                                    # Dr. GRPO
+        else:
+            adv = cen / (float(Rg.std(1).mean()) + 1e-6)  # constant scale, no per-group bias
+        adv[Rg.std(1) < 1e-6] = 0.0
+        advf = torch.tensor(adv.reshape(-1), device=dev)
+
+        seqs, vecs = [], []
+        for i in range(len(idx)):
+            for g in range(A.group):
+                r = tok.encode(texts[i][g] + (tok.eos_token or ""), add_special_tokens=False)
+                seqs.append(r[:A.max_new + 1])
+                vecs.append(Ab[i])
+        TOT_TOK = sum(len(r) for r in seqs)
+        opt.zero_grad(set_to_none=True)
+        klsum, nmb = 0.0, 0
+        for a in range(0, len(seqs), A.micro):
+            sl = slice(a, a + A.micro)
+            rs, vs, ad = seqs[sl], vecs[sl], advf[sl]
+            T = PLEN + max(len(r) for r in rs)
+            ids = torch.full((len(rs), T), tok.eos_token_id, device=dev, dtype=torch.long)
+            msk = torch.zeros((len(rs), T), device=dev, dtype=torch.bool)
+            for j, r in enumerate(rs):
+                ids[j, :PLEN] = PIDS
+                ids[j, PLEN:PLEN + len(r)] = torch.tensor(r, device=dev)
+                msk[j, PLEN:PLEN + len(r)] = True
+            vb = torch.stack([v.to(dev).float() for v in vs])
+            HOOK["vec"] = vb
+            lp = torch.log_softmax(model(input_ids=ids).logits[:, :-1].float(), -1)
+            rlp = None
+            if A.kl_beta > 0:
+                with torch.no_grad():
+                    model.set_adapter("reference")
+                    rlp = torch.log_softmax(model(input_ids=ids).logits[:, :-1].float(), -1)
+                    model.set_adapter("default")
+            HOOK["vec"] = None
+            tgt = ids[:, 1:]
+            m = msk[:, 1:]
+            g_new = lp.gather(2, tgt.unsqueeze(2)).squeeze(2)
+            if rlp is None:
+                kl = torch.zeros_like(g_new)            # KL term disabled
+            else:
+                g_ref = rlp.gather(2, tgt.unsqueeze(2)).squeeze(2)
+                d = (g_ref - g_new).clamp(-10, 10)
+                kl = (d.exp() - d - 1.0)                # k3, non-negative
+            per = -(ad.unsqueeze(1) * g_new - A.kl_beta * kl)
+            if A.loss_agg == "token":
+                # DAPO token-level: divide by the TOTAL tokens in the whole batch, so every token
+                # carries equal weight regardless of which sequence or micro-batch it landed in.
+                ((per * m).sum() / max(TOT_TOK, 1)).backward()
+                loss = (per * m).sum().detach() / m.sum().clamp(min=1)
+            else:
+                loss = (per * m).sum() / m.sum().clamp(min=1)
+                (loss * len(rs) / len(seqs)).backward()
+            klsum += float((kl * m).sum() / m.sum().clamp(min=1)); nmb += 1
+        if WORLD > 1:
+            for q in TRAIN:
+                if q.grad is not None:
+                    dist.all_reduce(q.grad); q.grad /= WORLD
+        # clip_grad_norm_ RETURNS THE PRE-CLIP NORM. The applied gradient is clipped to
+        # 1.0, so a logged 3-5 means clipping saturated, not that anything ran away --
+        # log both so the number on the dashboard is the one actually applied.
+        CLIP = 1.0
+        gn = torch.nn.utils.clip_grad_norm_(TRAIN, CLIP)
+        gn_post = min(float(gn), CLIP)
+        opt.step()
+
+        uw = float(np.mean([len(set(texts[i])) / A.group for i in range(len(idx))]))
+        import collections
+        ua = len({collections.Counter(texts[i]).most_common(1)[0][0]
+                  for i in range(len(idx))}) / max(1, len(idx))
+        log = {"reward/mean": float(R.mean()), "reward/std": float(R.std()),
+               "reward/max": float(R.max()), "kl_mean": klsum / max(1, nmb),
+               "len/uniq_within": uw, "len/uniq_across": ua, "grad_norm": float(gn), "grad_norm_clipped": gn_post,
+               "grad_clip_saturated": float(float(gn) > CLIP),
+               "len/mean_tok": float(np.mean([len(r) for r in seqs])), "carrier/n_avg": GRID.n_car, **BULLET_STATS}
+        if step % A.eval_every == 0:
+            pt = rollout(PROBE, A.group)
+            _pl = [LABELS[i] if i < len(LABELS) else "" for i in range(PROBE.shape[0])]
+            pR = reward(PROBE, pt, carrier, _pl)
+            log["probe/reward_mean"] = float(pR.mean())
+            if A.lam_div:
+                # reward() adds lam_div * (atoms used / bullets written), so the probe would rise
+                # with lam_div by CONSTRUCTION and stop measuring reconstruction. Recompute with the
+                # bonus off -- this is the number to judge the arm on.
+                _keep = A.lam_div
+                A.lam_div = 0.0
+                try:
+                    pC = reward(PROBE, pt, carrier, _pl)
+                finally:
+                    A.lam_div = _keep
+                log["probe/reward_clean"] = float(pC.mean())
+                log["probe/bonus_share"] = float(pR.mean() - pC.mean())
+            best = {}
+            for i, per in enumerate(pt):
+                sc = pR.reshape(len(pt), A.group)[i]
+                k = int(sc.argmax())
+                best[i] = (per[k], float(sc[k]))
+            if IS0:
+                import wandb as _w
+                tb = _w.Table(columns=["pos", "mark", "context", "phrase", "best"])
+                for i in sorted(best, key=lambda z: -best[z][1]):
+                    m_ = PMETA[i] if i < len(PMETA) else {}
+                    tb.add_data(i, m_.get("mark", ""), m_.get("ctx", "")[-70:],
+                                best[i][0], round(best[i][1], 4))
+                log["probe/rollouts"] = tb
+                print("[it %d] PROBE mean %.4f%s | top:"
+                      % (step, pR.mean(),
+                         ("  CLEAN %.4f" % log["probe/reward_clean"]) if A.lam_div else ""),
+                      flush=True)
+                for i in sorted(best, key=lambda z: -best[z][1])[:5]:
+                    m_ = PMETA[i] if i < len(PMETA) else {}
+                    print("     %.4f  %-5r ...%-42s -> %r"
+                          % (best[i][1], m_.get("mark", i), m_.get("ctx", "")[-42:],
+                             best[i][0][:44]), flush=True)
+        if IS0:
+            wandb.log(log, step=step)
+            print("[it %d] reward %.4f +-%.4f | uniq in %.0f%% / across %.0f%% | kl %.3f | "
+                  "len %.1f | car avg%d | grad %.3f (pre) %.2f (applied)"
+                  % (step, R.mean(), R.std(), 100 * uw, 100 * ua, log["kl_mean"],
+                     log["len/mean_tok"], GRID.n_car, float(gn), gn_post), flush=True)
+        if step % A.save_every == 0 and step > 0 and IS0:
+            model.save_pretrained("%s/iter_%06d" % (A.save_dir, step))
+    if IS0:
+        # The loop runs step 0..steps-1 and only saves on step%save_every==0, so the last
+        # save_every-1 steps were never written to disk. Save the actual final state.
+        model.save_pretrained("%s/final" % A.save_dir)
+        print("RL_DONE", flush=True)

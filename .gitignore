@@ -1,0 +1,12 @@
+# Shell launchers embed the HF token and the wandb key inline. Excluded wholesale rather than
+# scrubbed one-by-one; the Python they invoke is committed and takes its credentials from env.
+*.sh
+# logs and local scratch
+*.log
+__pycache__/
+*.pyc
+# large local artifacts (they live on the Modal volume / CA-MTL, not in git)
+*.npy
+*.jsonl
+*.parquet
+results_*.json
