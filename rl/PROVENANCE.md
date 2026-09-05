@@ -192,3 +192,30 @@ Trajectory in the deployment mode, before and after the normalisation fix:
     FIXED run step 10     0.5248
 
 Selection stays on this metric, never on reward.
+
+### Completed curve, modlens_fixed_contrast100 (wandb bdvkqi79), 100 steps
+
+Greedy/sampled conditioning delta on 256 bank rows, both injection modes:
+
+| ckpt | replace/greedy (deployment) | karvonen/T=1.0 (training) |
+|---|---|---|
+| SFT | 0.4768 | 0.3503 |
+| step_10 | 0.5248 | 0.4398 |
+| step_25 | 0.5213 | 0.4462 |
+| step_50 | 0.5219 | 0.4411 |
+| final (100) | **0.5322** | 0.4423 |
+
+RL gives +0.055 deployment-mode delta over the warm start (5-7 SE on a delta SE of ~0.008). The four
+RL points span 0.011 = ~1.4 SE, so they are mutually indistinguishable: essentially all of the gain
+is present by step 10, and steps 10->100 add at most +0.007 (0.9 SE), which is not resolvable. The
+training reward is flat over the same span (0.417 at step 10, then 0.40-0.43 for 90 steps, no trend
+over 9 logged points).
+
+**No degeneration anywhere.** 16/16 unique rollout texts at EVERY logged step, and ZERO first
+bullets shared across different activations at any step -- against the broken run, which shared one
+from step 40 and two by step 200. Entropy 3.68 -> 3.50, gnorm 0.17 against a clip of 1.0, kl_to_init
+~0.13 (KL contributes ~3% of the loss, so it is not the binding constraint).
+
+A flat curve here is a symptom, not a result: the policy is barely moving. Prime suspect is the
+learning rate -- this run used 1e-5 while the project's documented default for activation-injection
+work is 3e-5. `modlens_lr3e5` tests exactly that, one variable, everything else identical.
