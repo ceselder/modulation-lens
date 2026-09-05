@@ -93,6 +93,13 @@ class Lens:
         return h, n, p
 
     @modal.method()
+    def tokens(self, text: str):
+        """Token strings for the picker. The lens reads ONE position's residual, so which token you
+        pick is the whole experiment -- reading mid-sentence gives a different state than the end."""
+        ids = self.tok(text, add_special_tokens=False)["input_ids"]
+        return {"tokens": [self.tok.decode([i]) for i in ids], "n": len(ids)}
+
+    @modal.method()
     def read(self, text: str, pos: int = -1, max_new: int = 96, which: str = "both"):
         torch = self.torch
         h, n, p = self._activation(text, pos)
@@ -121,37 +128,61 @@ class Lens:
 PAGE = """<!doctype html><meta charset=utf-8><title>modulation lens</title>
 <style>
 body{background:#faf7f2;color:#1a1a1a;font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;
-     max-width:860px;margin:40px auto;padding:0 20px}
+     max-width:880px;margin:40px auto;padding:0 20px}
 h1{font-size:20px;margin:0 0 4px} .sub{color:#6b6b6b;font-size:13px;margin-bottom:22px}
-textarea{width:100%;height:110px;padding:11px;border:1px solid #d8d0c4;border-radius:7px;
+textarea{width:100%;height:100px;padding:11px;border:1px solid #d8d0c4;border-radius:7px;
      font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#fff;resize:vertical}
-button{margin-top:10px;padding:9px 20px;border:0;border-radius:7px;background:#c15f3c;color:#fff;
+button{padding:9px 20px;border:0;border-radius:7px;background:#c15f3c;color:#fff;
      font-size:14px;font-weight:600;cursor:pointer}button:disabled{opacity:.5}
-.row{display:flex;gap:14px;align-items:center;margin-top:10px;font-size:13px;color:#555}
-input[type=number]{width:80px;padding:6px;border:1px solid #d8d0c4;border-radius:5px}
-.card{margin-top:20px;padding:14px 16px;border:1px solid #e3dbcd;border-radius:8px;background:#fff}
-.card h3{margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#8a7f6d}
+button.ghost{background:#fff;color:#c15f3c;border:1px solid #e0cfc4}
+.row{display:flex;gap:12px;align-items:center;margin-top:12px;font-size:13px;color:#555;flex-wrap:wrap}
+select{padding:7px 9px;border:1px solid #d8d0c4;border-radius:6px;background:#fff;
+     font:13px/1.4 ui-monospace,Menlo,monospace;max-width:420px}
+input[type=number]{width:74px;padding:6px;border:1px solid #d8d0c4;border-radius:5px}
+.card{margin-top:18px;padding:14px 16px;border:1px solid #e3dbcd;border-radius:8px;background:#fff}
+.card h3{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#8a7f6d}
 pre{margin:0;white-space:pre-wrap;font:14px/1.6 ui-monospace,Menlo,monospace}
 .meta{color:#8a7f6d;font-size:12px;margin-top:14px}
-.ex{color:#c15f3c;cursor:pointer;text-decoration:underline;font-size:13px;margin-right:12px}
+.ex{color:#c15f3c;cursor:pointer;text-decoration:underline;font-size:13px;margin-right:10px}
 </style>
 <h1>modulation lens &mdash; 4-bullet readout</h1>
-<div class=sub>Type text. The lens reads the model's L42 state after consuming it and describes that
-state in four bullets. RL checkpoint vs the SFT warm start, same activation.</div>
-<textarea id=t placeholder="Almost all of my pieces are handmade,"></textarea>
+<div class=sub>Type text, pick which token's L42 state to read, and the lens describes that state in
+four bullets. RL checkpoint vs the SFT warm start, on the same activation.</div>
+<textarea id=t oninput="dirty()" placeholder="Almost all of my pieces are handmade,"></textarea>
 <div class=row>
-  <span>read position <input id=p type=number value=-1 title="-1 = last token"></span>
-  <span>max tokens <input id=m type=number value=96></span>
+  <button class=ghost onclick=tokenize()>list tokens &#8595;</button>
+  <select id=sel onchange="document.getElementById('p').value=this.value">
+    <option value=-1>-1 &mdash; last token (default)</option>
+  </select>
+  <span>or index <input id=p type=number value=-1></span>
+  <span>max tok <input id=m type=number value=96></span>
 </div>
 <div class=row><span>try:</span>
   <span class=ex onclick="setex(this)">Almost all of my pieces are handmade,</span>
-  <span class=ex onclick="setex(this)">be an AVR of sorts and just not have the Atmel logo on it?</span>
-  <span class=ex onclick="setex(this)">but what could they do?</span>
+  <span class=ex onclick="setex(this)">The defendant argued that the evidence had been obtained without a warrant,</span>
+  <span class=ex onclick="setex(this)">I've been feeling like nobody at work actually listens to me anymore,</span>
 </div>
-<button id=b onclick=go()>read the activation</button>
+<div class=row><button id=b onclick=go()>read the activation</button></div>
 <div id=out></div>
 <script>
-function setex(e){document.getElementById('t').value=e.textContent}
+function setex(e){document.getElementById('t').value=e.textContent; dirty(); tokenize()}
+function dirty(){const s=document.getElementById('sel');
+  if(s.dataset.for!==document.getElementById('t').value){
+    s.innerHTML='<option value=-1>-1 &mdash; last token (default)</option>'; delete s.dataset.for}}
+async function tokenize(){
+  const txt=document.getElementById('t').value, s=document.getElementById('sel');
+  if(!txt.trim())return;
+  s.innerHTML='<option>tokenizing...</option>';
+  const r=await fetch('tokens',{method:'POST',headers:{'Content-Type':'application/json'},
+                                body:JSON.stringify({text:txt})});
+  const j=await r.json();
+  if(j.error){s.innerHTML='<option value=-1>-1 &mdash; last token</option>';return}
+  let h='<option value=-1>-1 &mdash; last token ('+j.n+' tokens)</option>';
+  j.tokens.forEach((tk,i)=>{
+    const shown=tk.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])).replace(/ /g,'\u00b7');
+    h+='<option value='+i+'>'+i+' \u2014 "'+shown+'"</option>';});
+  s.innerHTML=h; s.dataset.for=txt;
+}
 async function go(){
   const b=document.getElementById('b'), out=document.getElementById('out');
   b.disabled=true; b.textContent='reading (first call loads 27B, ~5 min)...'; out.innerHTML='';
@@ -165,11 +196,14 @@ async function go(){
     else{
       let h='';
       for(const k of Object.keys(j.readouts)){
-        h+='<div class=card><h3>'+(k==='rl'?'RL checkpoint (delta 0.5322)':'SFT warm start (delta 0.4768)')
+        h+='<div class=card><h3>'+(k==='rl'?'RL checkpoint &middot; holdout delta 0.5322'
+                                          :'SFT warm start &middot; holdout delta 0.4768')
           +'</h3><pre>'+j.readouts[k].replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+'</pre></div>';
       }
-      h+='<div class=meta>read position '+j.read_pos+' of '+j.n_tokens+' tokens &middot; &#8214;h&#8214; '
-        +j.act_norm.toFixed(1)+' &middot; context at that position: <b>'+j.read_token.replace(/[<>&]/g,'')+'</b></div>';
+      h+='<div class=meta>read L42 at position '+j.read_pos+' of '+j.n_tokens
+        +' &middot; &#8214;h&#8214; '+j.act_norm.toFixed(1)
+        +' &middot; the model had just read: <b>'
+        +j.read_token.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+'</b></div>';
       out.innerHTML=h;
     }
   }catch(e){out.innerHTML='<div class=card><pre>'+e+'</pre></div>'}
@@ -189,6 +223,14 @@ def web():
     @api.get("/")
     def index():
         return HTMLResponse(PAGE)
+
+    @api.post("/tokens")
+    async def tokens(req: Request):
+        b = await req.json()
+        try:
+            return JSONResponse(Lens().tokens.remote(text=b.get("text") or ""))
+        except Exception as e:
+            return JSONResponse({"error": "%s: %s" % (type(e).__name__, e)})
 
     @api.post("/read")
     async def read(req: Request):
