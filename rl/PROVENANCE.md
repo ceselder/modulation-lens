@@ -219,3 +219,53 @@ from step 40 and two by step 200. Entropy 3.68 -> 3.50, gnorm 0.17 against a cli
 A flat curve here is a symptom, not a result: the policy is barely moving. Prime suspect is the
 learning rate -- this run used 1e-5 while the project's documented default for activation-injection
 work is 3e-5. `modlens_lr3e5` tests exactly that, one variable, everything else identical.
+
+---
+
+## 2026-09-05 -- why a step costs 104s, quantified (target for comparison: ~15s elsewhere)
+
+Measured at kl=0, 2 rollout + 6 trainer on B200:8, 16x256:
+
+    step 00001 | wait 0 score 12 update 72 [ref 0 fb 71 sync 0.6] | gen 104s
+
+Two rollout workers each emit one 2048-sequence block per ~104s = exactly one step of data per
+104s, while the trainer consumes a step in 85s. **Generation is the bottleneck**; `wait 0` only
+because the queue was pre-filled and had not drained yet.
+
+### Generation is prefill, and the prefill is redundant
+
+| per 2048-seq block | tokens |
+|---|---|
+| prefill (282-token prompt x 2048) | 578,000 |
+| decode (~38 tokens x 2048) | 78,000 |
+
+88% of generation work is prompt prefill. 578k tokens x 27B ~= 3.1e16 FLOPs, which a B200 should
+retire in ~28s at 50% MFU; we take 104s, i.e. **~7.5% MFU**, so ~3.7x is lost to configuration
+before any redesign. Live engine: `graphs=False max_num_seqs=512 mem=0.85 gdn_prefill=triton`.
+`--cuda-graphs` is opt-in and was never passed (though cudagraph_mode is FULL_DECODE_ONLY, so it
+only touches the 12% decode share); `--gdn-prefill-backend` has `flashinfer`/`auto` alternatives to
+the `triton` default.
+
+### THE root cause is the marker position, and it hits both sides
+
+The injected marker sits at **position 40 of the 282-token prompt**, so 242 tokens FOLLOW the
+per-request injection and cannot be shared:
+  * rollout: `enable_prefix_caching=False`, correctly -- caching the full prompt would serve one
+    request's injected state to another. Only tokens [0,40) are safely cacheable = 14%.
+  * trainer: 88% of every fwd/bwd is the same prefix, inflating compute AND activation memory ~4x,
+    which is a second reason `mb` probes at 6 against the header's expected 16-32.
+
+Moving `<concept>MARKER</concept>` to the END of the prompt makes 242/282 = 86% a shared prefix:
+prefix caching becomes both safe and worth ~6x on prefill, and the trainer stops re-processing
+instructions per rollout. Cost: it changes the trained prompt layout, so the SFT warm start and
+every baseline must be redone. Not done unilaterally.
+
+### Ranked
+
+| lever | effect | status |
+|---|---|---|
+| `--kl-coef 0` | update 99s -> 80s (ref pass gated on kl>0) | DONE |
+| marker to end of prompt | prefill ~6x, trainer prefix waste gone | needs SFT retrain -- user's call |
+| `--cuda-graphs`, `--gdn-prefill-backend auto`, `max_num_seqs` | up to ~3.7x of lost prefill MFU | measure with `--role bench-rollout --bench-configs` |
+| `--ar-offload` | frees 38 GB -> `mb` 6 -> 16-32 -> `fb` down | implemented, untested (228 GB host RAM risk) |
+| rebalance rollout/trainer split | max(208/R, 71*6/T + 12): 2/6=104s, 3/5=97s | marginal, do after the above |
