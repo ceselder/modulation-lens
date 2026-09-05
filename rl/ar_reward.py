@@ -175,7 +175,7 @@ class ARReward:
     def _maybe_whiten(self, x):
         return x if self.W is None else x @ self.W
 
-    def build_own(self, base_model="Qwen/Qwen3.6-27B", dtype=None):
+    def build_own(self, base_model="Qwen/Qwen3.6-27B", dtype=None, offload=False):
         """Load the AR on its OWN backbone, truncated to read_layer+1, with the adapter applied.
 
         Needed because the policy requires all layers to generate while the AR must be read on the
@@ -247,12 +247,36 @@ class ARReward:
             lambda m, i, o: self._hook_out.__setitem__(
                 "h", o[0] if isinstance(o, tuple) else o))
         return n
+        self._offload = bool(offload)
+        if self._offload:
+            self._own_to("cpu")   # park until the first scoring call
+
+    def _own_to(self, dev):
+        """Move the FROZEN AR backbone between CPU and GPU.
+
+        WHY. The AR is never updated -- no grads, no optimizer state -- yet build_own() runs inside
+        run_trainer, so a ~38 GB truncated 27B sits on EVERY trainer GPU and competes with the
+        activations of the backward it has nothing to do with. Measured: resident 90.0 GB, 87.6 GB
+        free, micro-batch probe settles at 6 where rl_disagg's own header expects 16-32. Parking it
+        on CPU between scoring calls returns those 38 GB to the fwd/bwd for ~1.5s of PCIe each way.
+
+        The proper fix is a dedicated scorer rank (the file protocol for it already exists); this is
+        the cheap version that needs no new process.
+        """
+        if getattr(self, "own", None) is None:
+            return
+        if next(self.own.parameters()).device.type != dev:
+            self.own.to(dev)
+            if dev == "cpu":
+                torch.cuda.empty_cache()
 
     @torch.no_grad()
     def embed(self, phrases, actor, tok, batch=128):
         """-> [n, D] unit vectors in the TARGET comparison space (J then affine)."""
         own = getattr(self, "own", None)
         if own is not None:
+            if getattr(self, "_offload", False):
+                self._own_to(self.dev)       # bring the frozen AR back for this scoring call only
             actor = own                      # its own truncated backbone; no adapter switching
             prev = None
         else:
@@ -272,6 +296,8 @@ class ARReward:
         finally:
             if prev is not None:
                 actor.set_adapter(prev)
+            if own is not None and getattr(self, "_offload", False):
+                self._own_to("cpu")          # hand the 38 GB back to the backward
         v = (out @ self.J.T) @ self.M.T
         return F.normalize(self._maybe_whiten(v), dim=-1)
 

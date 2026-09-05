@@ -155,6 +155,11 @@ def parse_args(argv=None):
     # the prompt is fixed and causal, making h_p a constant across rollouts.
     ap.add_argument("--inject-mode", default="karvonen", choices=["karvonen", "replace"],
                     help="rollout injection at the marker: replace (h'=v, lens-native) or karvonen")
+    # Park the frozen AR on CPU between scoring calls (~1.5s PCIe each way) so its ~38 GB goes to
+    # the fwd/bwd instead. rl_disagg's own header expects micro-batch 16-32; with the AR resident the
+    # probe settles at 6 (resident 90.0 GB, 87.6 GB free, peak 148.8 GB at L=378).
+    ap.add_argument("--ar-offload", action="store_true",
+                    help="park the frozen AR on CPU between scoring calls to raise the micro-batch")
     ap.add_argument("--ar-whiten", default="", help="npz holding a J-space whitener (C^-1/2)")
     ap.add_argument("--ar-whiten-key", default="W_ridge0.1",
                     help="key inside --ar-whiten; must be a RIDGED inverse (eigvals.min()==0)")
@@ -1804,7 +1809,10 @@ def run_trainer(a):
         if a.ar_whiten:
             AR_REWARD.load_whitener(a.ar_whiten, a.ar_whiten_key)
             _log(tag, "reward whitened in J-space: %s[%s]" % (a.ar_whiten, a.ar_whiten_key))
-        AR_REWARD.build_own(MODEL)
+        # offload the FROZEN AR to CPU between scoring calls: it has no gradients and no business
+        # holding ~38 GB on a backward GPU. rl_disagg's own header expects micro-batch 16-32; with
+        # the AR resident the probe settles at 6.
+        AR_REWARD.build_own(MODEL, offload=a.ar_offload)
         # The distinct-token fraction needs token ids only. Skip the clean-base logits forward
         # unless a fluency floor is actually in play, so a distinct-only gate is free.
         AR_REWARD.need_logp = a.fluency_floor is not None

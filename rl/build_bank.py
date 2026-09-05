@@ -21,12 +21,25 @@ img = (modal.Image.debian_slim(python_version="3.12")
 
 @app.function(image=img, volumes={"/vol": VOL}, cpu=8.0, memory=131072, timeout=7200)
 def build(n: int = 500000, out_dir: str = "/vol/rl_bank", d_model: int = 5120,
-          holdout: int = 2048):
-    import json, os
+          holdout: int = 2048, src: str = "/vol/data/prose_L42_500k.parquet"):
+    """src may be a single parquet or a GLOB of harvest shards (see rl/modal_harvest_prose.py).
+
+    A glob is how the bank grows past one epoch: 100 steps x 4096 rollouts is 0.82 epochs of the
+    original 497,952 rows, so training longer on that file re-visits targets instead of seeing new
+    ones. Shards are read in sorted order and concatenated, so the reserved holdout still comes from
+    the TAIL and no training row can leak into it.
+    """
+    import glob, json, os
     import numpy as np, pyarrow.parquet as pq
     os.makedirs(out_dir, exist_ok=True)
-    pf = pq.ParquetFile("/vol/data/prose_L42_500k.parquet")
-    total = min(n, pf.metadata.num_rows)
+    files = sorted(glob.glob(src)) if any(c in src for c in "*?[") else [src]
+    if not files:
+        raise SystemExit("no parquet matched %r" % src)
+    pfs = [pq.ParquetFile(f) for f in files]
+    avail = sum(x.metadata.num_rows for x in pfs)
+    print("[bank] %d file(s), %d rows available: %s"
+          % (len(files), avail, ", ".join(os.path.basename(f) for f in files[:6])), flush=True)
+    total = min(n, avail)
     # last `holdout` rows are reserved: the RL must never train on rows the readout eval uses
     n_tr = total - holdout
     print("[bank] %d rows -> %d train / %d holdout" % (total, n_tr, holdout), flush=True)
@@ -36,8 +49,14 @@ def build(n: int = 500000, out_dir: str = "/vol/rl_bank", d_model: int = 5120,
         mm = np.memmap(path, dtype=np.float32, mode="w+", shape=(hi - lo, d_model))
         meta = open(os.path.join(out_dir, tag.replace(".f32", "_meta.jsonl")), "w")
         row0, w = 0, 0
-        for bt in pf.iter_batches(batch_size=4096,
-                                  columns=["activation_vector", "label", "ctx", "doc_id", "pos"]):
+        def _batches():
+            for _pf in pfs:
+                for _bt in _pf.iter_batches(batch_size=4096,
+                                            columns=["activation_vector", "label", "ctx",
+                                                     "doc_id", "pos"]):
+                    yield _bt
+
+        for bt in _batches():
             b = bt.to_pydict()
             A = np.asarray(bt.column("activation_vector").flatten().to_numpy(zero_copy_only=False),
                            dtype="float32").reshape(-1, d_model)
@@ -60,3 +79,10 @@ def build(n: int = 500000, out_dir: str = "/vol/rl_bank", d_model: int = 5120,
         print("       rl_disagg would infer n_vecs = %d" % (sz // (4 * d_model)), flush=True)
     VOL.commit()
     print("BANK_DONE", flush=True)
+
+
+@app.local_entrypoint()
+def main(n: int = 500000, out_dir: str = "/vol/rl_bank", holdout: int = 2048,
+         src: str = "/vol/data/prose_L42_500k.parquet"):
+    """`--src '/vol/data/prose_L42_shards/*.parquet'` builds from the sharded harvest."""
+    build.remote(n=n, out_dir=out_dir, holdout=holdout, src=src)

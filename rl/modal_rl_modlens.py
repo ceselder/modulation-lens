@@ -123,15 +123,22 @@ TRAIN_ARGS = [
     # ScaleRL drops KL because its rewards are VERIFIABLE; ours is a learned surrogate and
     # therefore hackable in principle, so keep a small anchor to the warm start. Cheap insurance:
     # measured kl 0.0003-0.0010, i.e. it is not currently binding. Explicit flags beat the bundle.
-    # 0.01 anchored NOTHING: kl_to_init reached 4.2 by step 80, entropy fell 3.66 -> 0.36, and the
-    # run destabilised into asterisk spam (cos 0.000 at the 96-token cap) past step ~170.
-    "--kl-coef", "0.1",
+    # NO KL. It was added when the reward was inverted and the policy raced to a constant
+    # (kl_to_init 4.2 by step 80) -- but that was the broken objective, not a property of this one.
+    # With the reward fixed there is no degeneration to anchor against: 16/16 unique rollout texts at
+    # every logged step and ZERO first bullets shared across activations, over 100 steps. Meanwhile
+    # the anchor holds the policy near the SFT (kl_to_init ~0.13, gnorm 0.17 vs clip 1.0), which is
+    # the opposite of what a run that has barely moved needs. ScaleRL drops KL by design.
+    "--kl-coef", "0",
     # ---- generation ----
     "--min-new-tokens", "16",
     "--max-new-tokens", "96",        # 4 bullets x <=12 tokens + '* ' scaffolding
     "--len-penalty-start", "8",
     "--len-penalty-per-tok", "0.00025",
     # ---- optimisation ----
+    # 1e-5. The 3e-5 default in this project is for RECONSTRUCTION/injection training (the AR and
+    # the AV), not RL -- misapplying it there was my error; for RL 1e-4 ran hot with a decay
+    # signature and 1e-5 is the setting.
     "--lr", "1e-5",
     "--warmup-steps", "10",
     "--max-grad-norm", "1",

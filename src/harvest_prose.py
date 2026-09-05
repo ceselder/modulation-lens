@@ -44,6 +44,10 @@ ap.add_argument("--at-boundary", type=int, default=1,
                      "the reward literally asks for.")
 ap.add_argument("--out", default="/workspace/inv/data/prose_L42.parquet")
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--skip-docs", type=int, default=0,
+                help="skip this many documents first (O(skip) on a stream -- prefer --num-shards)")
+ap.add_argument("--num-shards", type=int, default=0, help="split the stream by file into N shards")
+ap.add_argument("--shard-idx", type=int, default=0, help="which shard this process harvests")
 A = ap.parse_args()
 random.seed(A.seed)
 BASE = "Qwen/Qwen3.6-27B"
@@ -74,16 +78,38 @@ print("[hp] %d delimiter token ids" % len(DELIM), flush=True)
 
 
 def docs():
+    """Documents in stream order, after skipping --skip-docs of them.
+
+    --skip-docs is what makes SHARDED harvesting possible: shard k skips k*stride documents, so N
+    containers cover DISJOINT slices of the same deterministic stream and their parquets concatenate
+    without overlap. --seed does NOT achieve this (it only reseeds position sampling within a doc,
+    while the stream order is identical), so every shard would re-harvest the same documents."""
+    n_skip = int(getattr(A, "skip_docs", 0) or 0)
+    n_shards = int(getattr(A, "num_shards", 0) or 0)
+    shard_ix = int(getattr(A, "shard_idx", 0) or 0)
+    seen = 0
     if A.corpus:
         for f in sorted(glob.glob(A.corpus)):
             for b in pq.ParquetFile(f).iter_batches(batch_size=64, columns=["text"]):
                 for t in b.to_pydict()["text"]:
+                    seen += 1
+                    if seen <= n_skip:
+                        continue
                     yield t
     else:
         from datasets import load_dataset
         ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train",
                           streaming=True, token=os.environ.get("HF_TOKEN"))
+        if n_shards > 1:
+            # shard() splits by FILE, so shards are disjoint at zero cost. --skip-docs on a
+            # streaming dataset is O(skip): it must stream and discard every skipped document, so
+            # shard 7 of 8 would download ~1.75M documents before harvesting its first row.
+            ds = ds.shard(num_shards=n_shards, index=shard_ix)
+            print("[shard] %d/%d by file" % (shard_ix, n_shards), flush=True)
         for r in ds:
+            seen += 1
+            if seen <= n_skip:
+                continue
             yield r["text"]
 
 
