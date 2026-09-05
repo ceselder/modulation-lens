@@ -28,7 +28,8 @@ def make_inject_hook(vecs, positions, coeff, device, dtype, mode="add"):
     counts = [len(p) for p in positions]
     if any(v.shape[0] != n for v, n in zip(vecs, counts)):
         raise ValueError("each vector row must have one vector per marker position")
-    normed = torch.nn.functional.normalize(torch.cat(vecs).to(device, dtype), dim=-1)
+    raw = torch.cat(vecs).to(device, dtype)                 # kept for mode="replace_raw"
+    normed = torch.nn.functional.normalize(raw, dim=-1)
     rows = torch.repeat_interleave(torch.arange(len(vecs), device=device),
                                   torch.tensor(counts, device=device))
     cols = torch.tensor([p for row in positions for p in row], device=device)
@@ -48,6 +49,14 @@ def make_inject_hook(vecs, positions, coeff, device, dtype, mode="add"):
             # before assignment so eager autograd and Dynamo both accept literal replacement.
             h = h.clone()
             h[rows, cols] = (normed * coeff).to(h.dtype).detach()
+        elif mode == "replace_raw":
+            # h'_p = v with v's OWN magnitude, matching inv_core.inject_at_marker(mode="replace").
+            # "replace" above normalises and rescales by a SHARED coeff, so it cannot reproduce a
+            # per-row raw activation -- and the modulation lens was trained on raw magnitudes, which
+            # are part of the signal. Needed so the HF logprob pass matches the vLLM rollout under
+            # --inject-mode replace; a mismatch there corrupts the importance ratios.
+            h = h.clone()
+            h[rows, cols] = raw.to(h.dtype).detach()
         else:
             raise ValueError(f"unknown injection mode: {mode}")
         return (h, *out[1:]) if isinstance(out, tuple) else h

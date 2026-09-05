@@ -189,6 +189,34 @@ def _marker_norm(actor, submodule, prompt, marker, device, adapter=True):
     return cap["h"][0, marker].norm().float().item()
 
 
+def _marker_vec(actor, submodule, prompt, marker, device, adapter=True):
+    """The full pre-injection residual AT the marker, not just its norm.
+
+    Same object _marker_norm already captures -- its own docstring says "A per-step constant: the
+    prompt is shared and causal, so every rollout's marker activation is identical". That constancy
+    is what makes exact REPLACE-mode injection possible through an ADD-only API:
+        replace  h'_p = v            <- what the SFT and every eval use (inv_core "replace")
+        add      h'_p = h_p + x      <- all vllm_lens SteeringVector can express
+        => x = v - h_p, with h_p captured once per publish.
+    Needed because a lens must be read with the mode it was trained with; feeding karvonen to a
+    replace-trained lens measured a 34% loss of conditioning delta (0.2298 -> 0.1520)."""
+    cap = {}
+
+    def grab(_m, _i, out):
+        cap["h"] = out[0] if isinstance(out, tuple) else out
+    hd = submodule.register_forward_hook(grab)
+    try:
+        ids = prompt.unsqueeze(0)
+        if adapter:
+            actor(input_ids=ids, attention_mask=torch.ones_like(ids))
+        else:
+            with actor.disable_adapter():
+                actor(input_ids=ids, attention_mask=torch.ones_like(ids))
+    finally:
+        hd.remove()
+    return cap["h"][0, marker].detach().float().cpu()
+
+
 def _save_adapter_for_vllm(actor, lora_dir):
     """Write the CURRENT 'default' adapter in the module naming vLLM expects for this model.
 
@@ -211,12 +239,20 @@ def _save_adapter_for_vllm(actor, lora_dir):
     return len(out)
 
 
-def _steer_vec(v, hnorm, marker):
+def _steer_vec(v, hnorm, marker, mode="karvonen", h_marker=None):
     """vllm_lens SteeringVector carrying the ABSOLUTE injection coeff*||h||*unit(v) (norm_match=False):
     lens adds the vector 1:1 into the residual stream, but its own norm_match would scale by the
     norm of vLLM's split-residual COMPONENT (~12% of the full stream) — verified numerically."""
     from vllm_lens import SteeringVector
-    vec = (F.normalize(v.float(), dim=0) * (hnorm * STEER_COEFF)).view(1, 1, -1).cpu()
+    if mode == "replace":
+        # h'_p = v exactly. vllm_lens only ADDS, so send v - h_p; h_p is a per-publish constant
+        # (fixed prompt, causal). Keeps v's DIRECTION AND MAGNITUDE, matching inv_core "replace",
+        # which is how the SFT was trained and how every eval and the playground read the lens.
+        if h_marker is None:
+            raise ValueError("--inject-mode replace needs the published marker vector")
+        vec = (v.float().cpu() - h_marker.float().cpu()).view(1, 1, -1)
+    else:
+        vec = (F.normalize(v.float(), dim=0) * (hnorm * STEER_COEFF)).view(1, 1, -1).cpu()
     return SteeringVector(activations=vec, layer_indices=[INJECT_LAYER], scale=1.0, norm_match=False,
                           position_indices=[marker])
 

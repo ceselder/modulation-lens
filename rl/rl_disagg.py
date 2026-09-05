@@ -147,6 +147,14 @@ def parse_args(argv=None):
     # Whitening the comparison space removes the target-blind component of the reward: a
     # constant direction is worth cos 0.343 unwhitened and 0.0064 whitened (measured, 20k rows),
     # and the first run duly spent one of four bullets on a fixed phrase. Applied to BOTH sides.
+    # INJECTION MODE. REPLACE (h'_p = v) is what the SFT was trained with and what every eval and
+    # the playground use. KARVONEN (h_p + ||h_p||*unit(v)) is maemm's steering convention, inherited
+    # with its rollout worker, and measured 34% less conditioning delta (0.1520 vs 0.2298) because a
+    # lens must be read with the mode it was trained with. vllm_lens SteeringVector can only ADD, so
+    # replace is emulated exactly as x = v - h_p using the per-publish marker vector -- valid because
+    # the prompt is fixed and causal, making h_p a constant across rollouts.
+    ap.add_argument("--inject-mode", default="karvonen", choices=["karvonen", "replace"],
+                    help="rollout injection at the marker: replace (h'=v, lens-native) or karvonen")
     ap.add_argument("--ar-whiten", default="", help="npz holding a J-space whitener (C^-1/2)")
     ap.add_argument("--ar-whiten-key", default="W_ridge0.1",
                     help="key inside --ar-whiten; must be a RIDGED inverse (eigvals.min()==0)")
@@ -323,6 +331,13 @@ def parse_args(argv=None):
 
 
 # The two bundles _resolve_recipe() fills unspecified (None) variant flags from. LEGACY == the pre-ScaleRL defaults.
+# The HF-side injection mode for the logprob/KL passes. MUST correspond to --inject-mode, or the
+# rollout and the update inject different states and every importance ratio is wrong:
+#   --inject-mode karvonen -> hook mode "add"          (h_p + ||h_p||*coeff*unit(v))
+#   --inject-mode replace  -> hook mode "replace_raw"  (h'_p = v, the lens-native feed)
+_HF_INJECT_MODE = "add"
+_HF_MODE_FOR = {"karvonen": "add", "replace": "replace_raw"}
+
 SCALERL_BUNDLE = {"loss": "cispo", "cispo_eps_max": 5.0, "loss_agg": "prompt", "zero_var_filter": True,
                   "npr_threshold": 0.9, "max_lag": 8, "fp32_head": True, "length_control": "penalty"}
 LEGACY_BUNDLE = {"loss": "ppo", "cispo_eps_max": 5.0, "loss_agg": "token", "zero_var_filter": False,
@@ -332,6 +347,8 @@ LEGACY_BUNDLE = {"loss": "ppo", "cispo_eps_max": 5.0, "loss_agg": "token", "zero
 def _resolve_recipe(a):
     """Fill every ScaleRL-variant flag the user did not give (None) from the bundle --recipe selects; --recipe scalerl also
     picks --adv-mode batch unless an advantage mode was given. With --recipe '' and no variant flags nothing changes."""
+    global _HF_INJECT_MODE
+    _HF_INJECT_MODE = _HF_MODE_FOR[a.inject_mode]
     if getattr(a, "no_fluency_floor", False):
         a.fluency_floor = None
     bundle = SCALERL_BUNDLE if a.recipe == "scalerl" else LEGACY_BUNDLE
@@ -773,10 +790,18 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
         os.environ.update(hidden)
 
 
-def _verify_injection(llm, prompt_ids, marker, hnorm, tag, seed=0):
-    """verify_vllm_injection without an HF actor: the injected vector is ABSOLUTE (norm_match=False), so
-    the captured marker-row delta must equal hnorm*STEER_COEFF*unit(v): cos>0.99, ratio in [0.95,1.05];
-    pre-marker rows untouched. Runs on the BASE weights (no LoRA request), greedy, 1 token."""
+def _verify_injection(llm, prompt_ids, marker, hnorm, tag, seed=0, mode="karvonen", h_marker=None):
+    """verify_vllm_injection without an HF actor: the injected vector is ABSOLUTE (norm_match=False).
+
+    MODE-AWARE, and that matters. The old version only ever checked the KARVONEN identity
+    (delta == hnorm*STEER_COEFF*unit(v)) using a RANDOM vector, so it reported cos=1.0000 while the
+    reward was being fed collapsed targets for two entire runs. A check that validates the transport
+    but not the SEMANTICS is worse than no check, because it reads as reassurance.
+
+      karvonen : delta must equal hnorm*STEER_COEFF*unit(v)  -> cos>0.99, ratio in [0.95,1.05]
+      replace  : the RESULTING marker row must equal v itself -> cos(h_steer[marker], v)>0.99 and
+                 ||h_steer[marker]|| / ||v|| in [0.95,1.05], which is the property the lens needs.
+    Pre-marker rows untouched either way. Runs on the BASE weights (no LoRA), greedy, 1 token."""
     import torch
     import torch.nn.functional as F
     import rl_hf as R
@@ -784,29 +809,43 @@ def _verify_injection(llm, prompt_ids, marker, hnorm, tag, seed=0):
     from mxf.config import D_MODEL, INJECT_LAYER, STEER_COEFF
     g = torch.Generator().manual_seed(seed)
     v = F.normalize(torch.randn(D_MODEL, generator=g), dim=0)
+    if mode == "replace":
+        # Give it a RAW-scale vector: replace is exactly the mode where magnitude is part of the
+        # signal, so testing with a unit vector would not exercise what the lens depends on.
+        v = v * float(hnorm)
 
     def run(steer):
         extra = {"output_residual_stream": [INJECT_LAYER]}
         if steer:
-            extra["apply_steering_vectors"] = [R._steer_vec(v, hnorm, marker)]
+            extra["apply_steering_vectors"] = [R._steer_vec(v, hnorm, marker, mode=mode,
+                                                            h_marker=h_marker)]
         out = llm.generate([{"prompt_token_ids": list(prompt_ids)}],
                            [SamplingParams(temperature=0.0, max_tokens=1, extra_args=extra)], use_tqdm=False)[0]
         act = getattr(out, "activations", None)
         assert act is not None and "residual_stream" in act, "capture returned nothing -- hooks not live?"
         return act["residual_stream"][0].float()
     h_clean, h_steer = run(False), run(True)
-    delta = h_steer[marker] - h_clean[marker]
-    cos = F.cosine_similarity(delta, v, dim=0).item()
-    ratio = (delta.norm() / (STEER_COEFF * hnorm)).item()
+    if mode == "replace":
+        # the RESULT must BE v, not merely differ by v
+        got = h_steer[marker]
+        cos = F.cosine_similarity(got, v, dim=0).item()
+        ratio = (got.norm() / v.norm()).item()
+    else:
+        delta = h_steer[marker] - h_clean[marker]
+        cos = F.cosine_similarity(delta, v, dim=0).item()
+        ratio = (delta.norm() / (STEER_COEFF * hnorm)).item()
     other = (h_steer[:marker] - h_clean[:marker]).norm(dim=-1).max().item() if marker > 0 else 0.0
-    chk = {"cos": cos, "norm_ratio": ratio, "hnorm_published": hnorm, "hnorm_vllm_base": h_clean[marker].norm().item(),
+    chk = {"mode": mode, "cos": cos, "norm_ratio": ratio, "hnorm_published": hnorm,
+           "hnorm_vllm_base": h_clean[marker].norm().item(),
            "max_other_row_delta": other, "ok": cos > 0.99 and 0.95 < ratio < 1.05}
-    _log(tag, f"injection check: cos={cos:.4f} ratio={ratio:.3f} ||h||_vllm_base={chk['hnorm_vllm_base']:.1f} "
+    _log(tag, f"injection check [{mode}]: cos={cos:.4f} ratio={ratio:.3f} "
+              f"||h||_vllm_base={chk['hnorm_vllm_base']:.1f} "
               f"(published adapter-on {hnorm:.1f}) pre-marker max|d|={other:.2e} -> {'OK' if chk['ok'] else 'FAIL'}")
     return chk
 
 
-def _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids, key_prefix):
+def _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids, key_prefix,
+                    h_marker=None):
     """ONE generate() call: one request per direction, n=G, steering keyed by _steering_id (one RPC for
     the whole block). Returns gen_ids (group-major, stop token kept via _trim_at_stop), per-token vLLM
     logprobs (None where the engine dropped the stop token and we re-appended it), appended count, gen_s."""
@@ -814,7 +853,8 @@ def _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_
     from vllm import SamplingParams
     G = a.group_size
     keys = [f"{key_prefix}_{i}" for i in range(len(dirs))]
-    payload = {k: [R._steer_vec(v, hnorm, marker)] for k, v in zip(keys, dirs)}
+    payload = {k: [R._steer_vec(v, hnorm, marker, mode=a.inject_mode, h_marker=h_marker)]
+               for k, v in zip(keys, dirs)}
     if a.stock_lens_hook:   # stock plugin protocol: per-request apply_steering_vectors (it does the RPCs itself)
         params = [SamplingParams(n=G, temperature=a.temperature, top_p=1.0, top_k=0, min_p=0.0, repetition_penalty=1.0,
                                  max_tokens=a.max_new_tokens, min_tokens=a.min_new_tokens, stop_token_ids=sorted(eos_ids),
@@ -848,14 +888,16 @@ def _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_
     return gen_ids, lps, appended, gen_s
 
 
-def _generate_eval_chunk(llm, a, tok, prompt_ids, marker, ch, dirs, hnorm, lora_req, eos_ids, key_prefix):
+def _generate_eval_chunk(llm, a, tok, prompt_ids, marker, ch, dirs, hnorm, lora_req, eos_ids, key_prefix,
+                         h_marker=None):
     """One generate() for an eval chunk: n samples per row at the set's temperature / token limits with the
     per-row seeds (deterministic like rl.py inline_eval), steering via _steering_id (one RPC per chunk).
     Returns {row: [n texts]} (stop token trimmed, decoded, empty -> ' ' as in inline_extra_evals)."""
     import rl_hf as R
     from vllm import SamplingParams
     keys = [f"{key_prefix}_{i}" for i in ch["rows"]]
-    payload = {k: [R._steer_vec(dirs[i], hnorm, marker)] for k, i in zip(keys, ch["rows"])}
+    payload = {k: [R._steer_vec(dirs[i], hnorm, marker, mode=a.inject_mode, h_marker=h_marker)]
+               for k, i in zip(keys, ch["rows"])}
     llm.collective_rpc("set_steering_data_many", args=(pickle.dumps(payload),))
     params = [SamplingParams(n=ch["n"], temperature=ch["temp"], top_p=1.0, top_k=0, min_p=0.0, repetition_penalty=1.0,
                              max_tokens=ch["max_new"], min_tokens=ch["min_new"], stop_token_ids=sorted(eos_ids), seed=sd,
@@ -885,6 +927,8 @@ class _EvalJob:
         d = f"{work}/lora/step_{self.adapter_step}"
         self.error = None if os.path.isdir(d) else f"adapter step {self.adapter_step} no longer published"
         self.hnorm = float(json.load(open(f"{d}/meta.json"))["hnorm"]) if self.error is None else None
+        _mh = f"{d}/marker_h.pt"
+        self.h_marker = torch.load(_mh, map_location="cpu") if (self.error is None and os.path.exists(_mh)) else None
         self.lora_req = LoRARequest(lora_name=f"step{self.adapter_step}", lora_int_id=self.adapter_step + 1, lora_path=d)
         self.dirs = {st["name"]: st["dirs"] for st in self.req["sets"]}
         self.chunks = _eval_plan(self.req, rank, n_rollout, a.eval_chunk_seqs)
@@ -986,21 +1030,28 @@ def run_rollout(a):
             return
         time.sleep(1.0)
     _log(tag, f"first adapter published after {time.time() - t_wait:.0f}s of waiting")
-    cur_step, lora_req, hnorm = None, None, None
+    cur_step, lora_req, hnorm, h_marker = None, None, None, None
 
     def refresh():
-        nonlocal cur_step, lora_req, hnorm
+        nonlocal cur_step, lora_req, hnorm, h_marker
         k = _read_latest(work)
         if k is None or k == cur_step:
             return False
         d = f"{work}/lora/step_{k}"
         meta = json.load(open(f"{d}/meta.json"))
         hnorm = float(meta["hnorm"])
+        # per-publish marker residual: required for --inject-mode replace (x = v - h_p)
+        _mh = f"{d}/marker_h.pt"
+        h_marker = torch.load(_mh, map_location="cpu") if os.path.exists(_mh) else None
+        if a.inject_mode == "replace" and h_marker is None:
+            raise RuntimeError("--inject-mode replace needs marker_h.pt in the published adapter dir "
+                               "(re-publish with a build that saves it)")
         lora_req = LoRARequest(lora_name=f"step{k}", lora_int_id=k + 1, lora_path=d)
         cur_step = k
         return True
     refresh()
-    chk = _verify_injection(llm, prompt_ids, marker, hnorm, tag, seed=a.seed)
+    chk = _verify_injection(llm, prompt_ids, marker, hnorm, tag, seed=a.seed,
+                            mode=a.inject_mode, h_marker=h_marker)
     json.dump(chk, open(f"{work}/verify_r{rank}.json", "w"))
     if not chk["ok"]:
         raise RuntimeError(f"vLLM steering does NOT match the HF inject hook: {chk}")
@@ -1065,7 +1116,7 @@ def run_rollout(a):
             # internally, so passing raw rows changes the reward ONLY, never the injected state.
             dirs = torch.from_numpy(np.asarray(bank[idx], dtype=np.float32))
         gen_ids, lps, appended, gen_s = _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids,
-                                                        key_prefix=f"r{rank}b{blk}")
+                                                        key_prefix=f"r{rank}b{blk}", h_marker=h_marker)
         n_tok = sum(len(g) for g in gen_ids)
         rec = {"block": blk, "rank": rank, "adapter_step": cur_step, "dir_idx": idx, "dirs": dirs, "gen_ids": gen_ids,
                "lps": lps, "appended": appended, "gen_s": gen_s, "n_tok": n_tok, "t_done": time.time(),
@@ -1283,7 +1334,8 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
                     Tc = Lc - p_len
                     b_ids, b_attn = ids[ix, :Lc].to(device), attn[ix, :Lc].to(device)
                     hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix),
-                                              STEER_COEFF, device, torch.bfloat16)
+                                              STEER_COEFF, device, torch.bfloat16,
+                                              mode=_HF_INJECT_MODE)
                     with R.hooked(submodule, hook):
                         lg = actor(input_ids=b_ids, attention_mask=b_attn, use_cache=False, logits_to_keep=Tc + 1).logits[:, :-1]
                     for c0 in range(0, Tc, a.vocab_chunk):
@@ -1303,7 +1355,8 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         b_ids, b_attn = ids[ix, :Lc].to(device), attn[ix, :Lc].to(device)
         m = gen_mask[ix, :Tc].to(device); w = w_all[ix, :Tc].to(device); A = adv[ix, None].to(device)
         olp = old_lp[ix, :Tc].to(device); kn = known[ix, :Tc].to(device)
-        hook = _hook_outside_autocast(R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix), STEER_COEFF, device, torch.bfloat16),
+        hook = _hook_outside_autocast(R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix), STEER_COEFF, device, torch.bfloat16,
+                                              mode=_HF_INJECT_MODE),
                                       a.autocast_bf16)
         with R.hooked(submodule, hook):
             with _policy_precision(actor, a.autocast_bf16):   # --autocast-bf16: bf16 LoRA matmuls/activations; fp32 vocab math below is outside
@@ -1626,10 +1679,15 @@ def _publish_adapter(actor, submodule, prompt, marker, device, work, step, keep,
     import rl_hf as R
     t0 = time.time()
     hnorm = R._marker_norm(actor, submodule, prompt, marker, device, adapter=True)
+    # The full marker residual, so the rollout can do exact REPLACE through the add-only API
+    # (x = v - h_p). Same forward _marker_norm already runs; a per-publish constant.
+    h_marker = R._marker_vec(actor, submodule, prompt, marker, device, adapter=True)
     t_norm = time.time() - t0
     d = f"{work}/lora/step_{step}"
     n, tm = _save_adapter_for_vllm(actor, d, torch.float32 if fp32 else torch.bfloat16)
-    json.dump({"step": step, "hnorm": hnorm, "n_tensors": n, "t": time.time()}, open(f"{d}/meta.json", "w"))
+    torch.save(h_marker, f"{d}/marker_h.pt")
+    json.dump({"step": step, "hnorm": hnorm, "n_tensors": n, "t": time.time(),
+               "marker_h": "marker_h.pt"}, open(f"{d}/meta.json", "w"))
     _atomic_write_text(f"{work}/lora/latest", str(step))
     for old in sorted(glob.glob(f"{work}/lora/step_*"), key=lambda p: int(p.rsplit("_", 1)[-1]))[:-keep]:
         shutil.rmtree(old, ignore_errors=True)
